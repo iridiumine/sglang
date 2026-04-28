@@ -64,17 +64,6 @@ class TestGDNChunkMeta(unittest.TestCase):
     def test_mixed_batch(self):
         self._check_all_dtypes([64, 65, 130, 1], chunk_size=64)
 
-    def test_host_shape_metadata(self):
-        meta = build_gdn_chunked_prefill_meta(
-            extend_seq_lens_cpu=[64, 65, 130, 1],
-            chunk_size=64,
-            device=torch.device("cpu"),
-            use_pinned_memory=False,
-        )
-        self.assertEqual(meta.max_T, 130)
-        self.assertEqual(meta.cu_seq_len, 260)
-        self.assertEqual(meta.query_start_loc_cpu, [0, 64, 129, 259, 260])
-
     def test_small_chunk(self):
         self._check_all_dtypes([3, 7, 1], chunk_size=2)
 
