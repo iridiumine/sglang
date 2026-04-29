@@ -12,6 +12,77 @@ if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
     from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
 
+from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.utils.custom_op import register_custom_op
+
+
+@register_custom_op(mutates_args=["topk_weights", "topk_ids"])
+@register_split_op()
+def fused_topk_npu_compute(
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int,
+    use_grouped_topk: bool,
+    renormalize: bool,
+    num_fused_shared_experts: int,
+    correction_bias: Optional[torch.Tensor] = None,
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+    routed_scaling_factor: float = 1.0,
+) -> None:
+    if not use_grouped_topk and correction_bias is None:
+        tw, ti, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
+            router_logits,
+            k=top_k,
+        )
+        if renormalize:
+            w = tw if num_fused_shared_experts == 0 else tw[:, :-1]
+            w = l1_norm(w)
+            if num_fused_shared_experts == 0:
+                tw = w
+            else:
+                tw = torch.cat([w, tw[:, -1:]], dim=-1)
+        tw = tw.to(torch.float32)
+        topk_weights.copy_(tw)
+        topk_ids.copy_(ti)
+    elif use_grouped_topk and correction_bias is not None:
+        tw, ti, _ = torch.ops.npu.npu_moe_gating_top_k(
+            router_logits.to(torch.float32),
+            k=top_k,
+            bias=correction_bias.to(torch.float32),
+            k_group=topk_group,
+            group_count=num_expert_group,
+            group_select_mode=1,
+            renorm=0,
+            norm_type=1,
+            routed_scaling_factor=(
+                1 if renormalize else routed_scaling_factor
+            ),
+            eps=float(1e-20),
+        )
+        topk_weights.copy_(tw)
+        topk_ids.copy_(ti)
+    elif correction_bias is not None:
+        tw, ti, _ = torch.ops.npu.npu_moe_gating_top_k(
+            router_logits.to(torch.float32),
+            k=top_k,
+            bias=correction_bias.to(torch.float32),
+            renorm=0,
+            norm_type=1,
+            routed_scaling_factor=(
+                1 if renormalize else routed_scaling_factor
+            ),
+            eps=float(1e-20),
+        )
+        topk_weights.copy_(tw)
+        topk_ids.copy_(ti)
+    else:
+        raise NotImplementedError(
+            "fused_topk_npu_compute does not support custom_routing_function "
+            "or torch_native fallback"
+        )
+
 
 def fused_topk_npu(
     hidden_states: torch.Tensor,
@@ -26,59 +97,10 @@ def fused_topk_npu(
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
 
-    # Fast path: simple top-k without grouped routing and bias
-    if not use_grouped_topk and correction_bias is None:
-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
-            router_logits,
-            k=topk_config.top_k,
-        )
-
-        if renormalize:
-            topk_weights = l1_norm(
-                topk_weights
-                if topk_config.num_fused_shared_experts == 0
-                else topk_weights[:, :-1]
-            )
-        topk_weights = topk_weights.to(torch.float32)
-
-    # Grouped top-k with correction bias
-    elif use_grouped_topk and correction_bias is not None:
-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
-            router_logits.to(torch.float32),
-            k=topk_config.top_k,
-            bias=correction_bias.to(torch.float32),
-            k_group=topk_config.topk_group,
-            group_count=topk_config.num_expert_group,
-            group_select_mode=1,
-            renorm=0,
-            norm_type=1,
-            routed_scaling_factor=(
-                1 if renormalize else topk_config.routed_scaling_factor
-            ),
-            eps=float(1e-20),
-        )
-
-    # npu_moe_gating_top_k is not yet supported custom_routing_function
-    # torch native is not yet supported num_token_non_padded
-    elif (
-        topk_config.custom_routing_function is None
-        and num_token_non_padded is not None
-        and correction_bias is not None
+    if (
+        topk_config.custom_routing_function is not None
+        or (num_token_non_padded is None and correction_bias is not None and not use_grouped_topk)
     ):
-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
-            router_logits.to(torch.float32),
-            k=topk_config.top_k,
-            bias=correction_bias.to(torch.float32),
-            renorm=0,
-            norm_type=1,
-            routed_scaling_factor=(
-                1 if renormalize else topk_config.routed_scaling_factor
-            ),
-            eps=float(1e-20),
-        )
-
-    # Fallback to torch native implementation
-    else:
         topk_config.torch_native = True
         return select_experts(
             hidden_states=hidden_states,
@@ -89,12 +111,35 @@ def fused_topk_npu(
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
 
-    if expert_location_dispatch_info is not None:
-        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
-    get_global_experts_capturer().capture(
-        layer_id=layer_id,
-        topk_ids=topk_ids,
+    num_tokens = router_logits.shape[0]
+    top_k = topk_config.top_k
+    out_topk_weights = torch.empty(
+        num_tokens, top_k, dtype=torch.float32, device=router_logits.device
+    )
+    out_topk_ids = torch.empty(
+        num_tokens, top_k, dtype=torch.int64, device=router_logits.device
     )
 
-    return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+    torch.ops.sglang.fused_topk_npu_compute(
+        router_logits,
+        out_topk_weights,
+        out_topk_ids,
+        top_k,
+        use_grouped_topk,
+        renormalize,
+        topk_config.num_fused_shared_experts,
+        correction_bias,
+        topk_config.num_expert_group if topk_config.num_expert_group is not None else 0,
+        topk_config.topk_group if topk_config.topk_group is not None else 0,
+        topk_config.routed_scaling_factor if topk_config.routed_scaling_factor is not None else 1.0,
+    )
+
+    if expert_location_dispatch_info is not None:
+        out_topk_ids = topk_ids_logical_to_physical(out_topk_ids, expert_location_dispatch_info)
+    get_global_expert_distribution_recorder().on_select_experts(topk_ids=out_topk_ids)
+    get_global_experts_capturer().capture(
+        layer_id=layer_id,
+        topk_ids=out_topk_ids,
+    )
+
+    return StandardTopKOutput(out_topk_weights, out_topk_ids, router_logits)
