@@ -85,7 +85,63 @@ if _use_aiter and _is_gfx95_supported:
 
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 elif _is_npu:
+    from sglang.srt.compilation.compilation_config import register_split_op
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
+    from sglang.srt.utils.custom_op import register_custom_op
+
+    def _attn_tp_all_gather_npu_fake(
+        hidden_states: torch.Tensor,
+        attn_tp_size: int,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (hidden_states.shape[0] * attn_tp_size, *hidden_states.shape[1:]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+    @register_custom_op(
+        op_name="attn_tp_all_gather_npu",
+        fake_impl=_attn_tp_all_gather_npu_fake,
+    )
+    @register_split_op()
+    def attn_tp_all_gather_npu(
+        hidden_states: torch.Tensor,
+        attn_tp_size: int,
+    ) -> torch.Tensor:
+        output = torch.empty(
+            (hidden_states.shape[0] * attn_tp_size, *hidden_states.shape[1:]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        attn_tp_all_gather_into_tensor(output, hidden_states)
+        return output
+
+    def _attn_tp_reduce_scatter_npu_fake(
+        hidden_states: torch.Tensor,
+        attn_tp_size: int,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (hidden_states.shape[0] // attn_tp_size, *hidden_states.shape[1:]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+    @register_custom_op(
+        op_name="attn_tp_reduce_scatter_npu",
+        fake_impl=_attn_tp_reduce_scatter_npu_fake,
+    )
+    @register_split_op()
+    def attn_tp_reduce_scatter_npu(
+        hidden_states: torch.Tensor,
+        attn_tp_size: int,
+    ) -> torch.Tensor:
+        output = torch.empty(
+            (hidden_states.shape[0] // attn_tp_size, *hidden_states.shape[1:]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        attn_tp_reduce_scatter_tensor(output, hidden_states)
+        return output
 
 
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
@@ -747,14 +803,17 @@ class CommunicateSimpleFn:
                 gathered_hidden_states.append(output)
             return tuple(gathered_hidden_states)
 
-        hidden_states, local_hidden_states = (
-            get_local_dp_buffer(),
-            hidden_states,
-        )
-        attn_tp_all_gather_into_tensor(
-            hidden_states,
-            local_hidden_states,
-        )
+        if _is_npu:
+            hidden_states = attn_tp_all_gather_npu(hidden_states, context.attn_tp_size)
+        else:
+            hidden_states, local_hidden_states = (
+                get_local_dp_buffer(),
+                hidden_states,
+            )
+            attn_tp_all_gather_into_tensor(
+                hidden_states,
+                local_hidden_states,
+            )
         return hidden_states
 
 
@@ -844,11 +903,14 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
 
         if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
-            residual, local_residual = (
-                get_local_dp_buffer(),
-                residual,
-            )
-            attn_tp_all_gather_into_tensor(residual, local_residual)
+            if _is_npu:
+                residual = attn_tp_all_gather_npu(residual, context.attn_tp_size)
+            else:
+                residual, local_residual = (
+                    get_local_dp_buffer(),
+                    residual,
+                )
+                attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
             # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
             use_layer_norm_before_gather = context.attn_tp_size == 1
@@ -1003,14 +1065,22 @@ class CommunicateSummableTensorPairFn:
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
     ):
-        hidden_states, global_hidden_states = (
-            get_local_dp_buffer(),
-            hidden_states,
-        )
         if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
-            # When using padding, all_reduce is skipped after MLP and MOE and reduce scatter is used here instead.
-            dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
+            if _is_npu:
+                hidden_states = attn_tp_reduce_scatter_npu(
+                    hidden_states, context.attn_tp_size
+                )
+            else:
+                hidden_states, global_hidden_states = (
+                    get_local_dp_buffer(),
+                    hidden_states,
+                )
+                dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:
+            hidden_states, global_hidden_states = (
+                get_local_dp_buffer(),
+                hidden_states,
+            )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
         return hidden_states, residual
 
@@ -1024,14 +1094,17 @@ class CommunicateSummableTensorPairFn:
     ):
         hidden_states += residual
         residual = None
-        hidden_states, local_hidden_states = (
-            get_local_dp_buffer(),
-            hidden_states,
-        )
-        attn_tp_all_gather_into_tensor(
-            hidden_states,
-            local_hidden_states,
-        )
+        if _is_npu:
+            hidden_states = attn_tp_all_gather_npu(hidden_states, context.attn_tp_size)
+        else:
+            hidden_states, local_hidden_states = (
+                get_local_dp_buffer(),
+                hidden_states,
+            )
+            attn_tp_all_gather_into_tensor(
+                hidden_states,
+                local_hidden_states,
+            )
         return hidden_states, residual
 
     @staticmethod
