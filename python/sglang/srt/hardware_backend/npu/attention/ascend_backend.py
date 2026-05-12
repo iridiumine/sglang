@@ -35,6 +35,8 @@ import logging
 
 import numpy as np
 
+# default max value of sliding window size
+SWA_INT_MAX = 2147483647
 
 def _reshape_kv_for_fia_nz(
     tensor: torch.Tensor, num_heads: int, head_dim: int, page_size: int
@@ -990,6 +992,7 @@ class AscendAttnBackend(AttentionBackend):
                 save_kv_cache,
                 q_rope=q_rope,
                 k_rope=k_rope,
+                sinks=sinks
             )
 
         if not self.use_mla:
@@ -1534,6 +1537,7 @@ class AscendAttnBackend(AttentionBackend):
         save_kv_cache: bool,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
         if save_kv_cache:
             if self.use_mla:
@@ -1574,83 +1578,24 @@ class AscendAttnBackend(AttentionBackend):
                     self.speculative_num_draft_tokens + query.shape[0],
                     self.speculative_num_draft_tokens,
                 )
-            if layer.qk_head_dim != layer.v_head_dim:
-                use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
-                q_ = query
-                if layer.qk_head_dim != layer.v_head_dim:
-                    attn_output = q_.new_empty(
-                        (q_.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-                    )
-                else:
-                    attn_output = torch.empty_like(q_)
-                o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                k_c = k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-                v_c = v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
-                if forward_batch.extend_prefix_lens is None:
-                    batch_size = len(forward_batch.seq_lens)
-                    extend_prefix_lens = forward_batch.seq_lens - self.speculative_num_draft_tokens
-                    extend_seq_lens = torch.full(
-                        (batch_size,), 
-                        self.speculative_num_draft_tokens, 
-                        dtype=torch.int32, 
-                        device=forward_batch.seq_lens.device
-                    )
-                else:
-                    extend_prefix_lens = forward_batch.extend_prefix_lens
-                    extend_seq_lens = forward_batch.extend_seq_lens
-
-                attn_output = self.native_attn.run_sdpa_forward_extend(
-                    q_,
-                    o_,
-                    k_c,
-                    v_c,
-                    forward_batch.req_to_token_pool.req_to_token,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    extend_prefix_lens,
-                    extend_seq_lens,
-                    forward_batch.encoder_lens,
-                    is_cross_attention=layer.is_cross_attention,
-                    scaling=layer.scaling,
-                    enable_gqa=use_gqa,
-                    causal=True,
-                    logit_cap=layer.logit_cap,
-                    logit_capping_method=layer.logit_capping_method,
-                )
-                attn_output = attn_output.view(
-                    -1, layer.tp_q_head_num * layer.v_head_dim
-                )
-                if (
-                    not self.graph_mode
-                    and forward_batch.num_token_non_padded_cpu != num_token_padding
-                ):
-                    attn_output = torch.cat(
-                        [
-                            attn_output,
-                            attn_output.new_zeros(
-                                num_token_padding - forward_batch.num_token_non_padded_cpu,
-                                *attn_output.shape[1:],
-                            ),
-                        ],
-                        dim=0,
-                    )
-                return attn_output
-
-            attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score_v2(
                 query,
                 k_cache,
                 v_cache,
                 block_table=self.forward_metadata.block_tables,
                 block_size=self.page_size,
-                num_heads=layer.tp_q_head_num,
+                num_query_heads=layer.tp_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="TND",
                 atten_mask=self.mtp_mask,
-                scale=layer.scaling,
-                actual_seq_lengths=actual_seq_lengths,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                sparse_mode=3,
+                softmax_scale=layer.scaling,
+                actual_seq_qlen=actual_seq_lengths,
+                actual_seq_kvlen=actual_seq_lengths_kv,
+                sparse_mode=4 if layer.sliding_window_size != -1 else 3,
+                pre_tokens=layer.sliding_window_size if layer.sliding_window_size != -1 else SWA_INT_MAX,
+                next_tokens=0,
+                learnable_sink=sinks,
             )
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
