@@ -604,8 +604,23 @@ class MiMoV2Attention(nn.Module):
 
         if self.v_scale is not None:
             v = v * self.v_scale
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        if get_tensor_model_parallel_rank() == 0:
+            print(
+                f"  [Attn] after RoPE: q mean={q.mean():.6f} std={q.std():.6f}, "
+                f"k mean={k.mean():.6f} std={k.std():.6f}, v mean={v.mean():.6f} std={v.std():.6f}"
+            )
         attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
+        if get_tensor_model_parallel_rank() == 0:
+            print(
+                f"  [Attn] after RadixAttention: mean={attn_output.mean():.6f} std={attn_output.std():.6f}"
+            )
         output, _ = self.o_proj(attn_output)
+        if get_tensor_model_parallel_rank() == 0:
+            print(
+                f"  [Attn] after o_proj (final): mean={output.mean():.6f} std={output.std():.6f}"
+            )
         return output
 
 
@@ -734,10 +749,27 @@ class MiMoV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.layer_id == 0:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            rank = get_tensor_model_parallel_rank()
+        else:
+            rank = -1
+
+        if rank == 0:
+            print(
+                f"[Layer {self.layer_id}] input: {hidden_states.shape=}, mean={hidden_states.mean():.6f}, std={hidden_states.std():.6f}, "
+                f"residual={None if residual is None else f'{residual.shape}, mean={residual.mean():.6f}'}"
+            )
+
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
+        if rank == 0:
+            print(
+                f"[Layer {self.layer_id}] after prepare_attn: {hidden_states.shape=}, mean={hidden_states.mean():.6f}, std={hidden_states.std():.6f}"
+            )
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -745,10 +777,19 @@ class MiMoV2DecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        if rank == 0:
+            print(
+                f"[Layer {self.layer_id}] after self_attn: {hidden_states.shape=}, mean={hidden_states.mean():.6f}, std={hidden_states.std():.6f}"
+            )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        if rank == 0:
+            print(
+                f"[Layer {self.layer_id}] after prepare_mlp: {hidden_states.shape=}, mean={hidden_states.mean():.6f}, std={hidden_states.std():.6f}, "
+                f"residual mean={residual.mean():.6f}"
+            )
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -764,12 +805,21 @@ class MiMoV2DecoderLayer(nn.Module):
         hidden_states = self.mlp(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
+        if rank == 0:
+            print(
+                f"[Layer {self.layer_id}] after mlp: {hidden_states.shape=}, mean={hidden_states.mean():.6f}, std={hidden_states.std():.6f}"
+            )
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
+            )
+        if rank == 0:
+            print(
+                f"[Layer {self.layer_id}] output: {hidden_states.shape=}, mean={hidden_states.mean():.6f}, std={hidden_states.std():.6f}, "
+                f"residual mean={residual.mean():.6f}"
             )
 
         return hidden_states, residual
@@ -900,6 +950,13 @@ class MiMoV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        if get_tensor_model_parallel_rank() == 0 and self.pp_group.is_first_rank:
+            print(
+                f"  [MimoModel] input_ids={input_ids.shape}, positions={positions.shape} {positions[:10].tolist()}, "
+                f"extend_seq_lens={forward_batch.extend_seq_lens}"
+            )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -1221,15 +1278,38 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         else:
-            hidden_states, hidden_states_before_norm = self.model(
+            output = self.model(
                 input_ids,
                 positions,
                 forward_batch,
                 input_embeds,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            if isinstance(output, PPProxyTensors):
+                if get_tensor_model_parallel_rank() == 0:
+                    hs = output["hidden_states"]
+                    print(
+                        f"PPProxyTensors: {hs.shape=}, {hs.mean()=}, {hs.std()=}, "
+                        f"last_hs mean={hs[-1].mean():.6f} std={hs[-1].std():.6f}"
+                    )
+                return output
+            hidden_states, hidden_states_before_norm = output[:2]
+            if get_tensor_model_parallel_rank() == 0:
+                print(
+                    f"{hidden_states.shape=}, {hidden_states.mean()=}, {hidden_states.std()=}"
+                )
 
         if self.pp_group.is_last_rank:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            if get_tensor_model_parallel_rank() == 0:
+                last_hs = hidden_states[-1]
+                print(
+                    f"[Logits] last_hs: mean={last_hs.mean():.6f} std={last_hs.std():.6f} "
+                    f"min={last_hs.min():.6f} max={last_hs.max():.6f}"
+                )
             return self.logits_processor(
                 input_ids,
                 hidden_states,

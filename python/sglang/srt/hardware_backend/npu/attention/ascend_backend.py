@@ -1167,6 +1167,16 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     block_tables = self.forward_metadata.block_tables
                 if self.use_fia:
+                    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+                    if get_tensor_model_parallel_rank() == 0:
+                        print(
+                            f"  [SwFIA layer={layer.layer_id}] "
+                            f"q_tokens={q.shape[0]}, num_token_non_padded={forward_batch.num_token_non_padded_cpu}, "
+                            f"seq_lens_list_cumsum={self.forward_metadata.seq_lens_list_cumsum}, "
+                            f"seq_lens_cpu_int={self.forward_metadata.seq_lens_cpu_int}, "
+                            f"block_tables.shape={block_tables.shape}"
+                        )
                     if self._can_use_tnd(layer):
                         num_token_padding = q.shape[0]
                         if num_token_padding > forward_batch.num_token_non_padded_cpu:
@@ -1274,6 +1284,7 @@ class AscendAttnBackend(AttentionBackend):
                         )
 
                 else:
+                    # support cross attention
                     attn_out = attention_sinks_prefill_triton(
                         q,
                         k_cache,

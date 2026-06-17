@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -849,6 +850,16 @@ class LogitsProcessor(nn.Module):
 
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
 
+        if (
+            logits_metadata.forward_mode.is_extend()
+            and get_tensor_model_parallel_rank() == 0
+        ):
+            print(
+                f"  [LogitsProcessor] after lm_head: shape={logits.shape}, "
+                f"mean={logits.mean():.6f} std={logits.std():.6f} "
+                f"min={logits.min():.6f} max={logits.max():.6f}"
+            )
+
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
@@ -861,6 +872,18 @@ class LogitsProcessor(nn.Module):
         logits = self._scatter_dp_attn_logits(
             logits, local_hidden_states, logits_metadata
         )
+
+        if (
+            logits_metadata.forward_mode.is_extend()
+            and get_tensor_model_parallel_rank() == 0
+        ):
+            topk = logits[0].topk(5)
+            print(
+                f"  [LogitsProcessor] final logits: shape={logits.shape}, "
+                f"mean={logits.mean():.6f} std={logits.std():.6f} "
+                f"min={logits.min():.6f} max={logits.max():.6f}, "
+                f"top5_ids={topk.indices.tolist()}, top5_vals={topk.values.tolist()}"
+            )
 
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
 
@@ -880,6 +903,13 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if get_tensor_model_parallel_rank() == 0 and self.training is False:
+            print(
+                f"  [lm_head] weight shape={lm_head.weight.shape}, dtype={lm_head.weight.dtype}, "
+                f"mean={lm_head.weight.mean():.6f} std={lm_head.weight.std():.6f} "
+                f"min={lm_head.weight.min():.6f} max={lm_head.weight.max():.6f}, "
+                f"[0,0]={lm_head.weight[0,0]}"
+            )
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
