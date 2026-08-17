@@ -410,6 +410,19 @@ class UnifiedRadixCache(BasePrefixCache):
             self.host_pool_group.destroy()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        # region debug-point l3-trace-match-prefix
+        try:
+            _dbg_rank0 = (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_rank() == 0
+            )
+        except Exception:
+            _dbg_rank0 = True
+        _dbg_key_len = len(params.key)
+        _dbg_req_rid = getattr(getattr(params, "req", None), "rid", "N/A")
+        # endregion debug-point l3-trace-match-prefix
+
         result = self.session.try_match_prefix(params)
         if result is not None:
             logger.debug(
@@ -418,6 +431,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 len(result.device_indices),
                 result.host_hit_length,
             )
+            # region debug-point l3-trace-match-prefix
+            if _dbg_rank0 and self.enable_storage:
+                logger.info(
+                    "[L3-DBG][match_prefix SESSION] rid=%s, L1_device_hit=%d, "
+                    "L2_host_hit=%d, key_len=%d",
+                    _dbg_req_rid,
+                    len(result.device_indices),
+                    result.host_hit_length,
+                    _dbg_key_len,
+                )
+            # endregion debug-point l3-trace-match-prefix
             return result
         if self.disable:
             return self.tree_core.empty_match_result
@@ -436,6 +460,21 @@ class UnifiedRadixCache(BasePrefixCache):
             result.host_hit_length,
             len(params.key),
         )
+        # region debug-point l3-trace-match-prefix
+        if _dbg_rank0 and self.enable_storage:
+            logger.info(
+                "[L3-DBG][match_prefix TREE] rid=%s, L1_device_hit=%d, "
+                "L2_host_hit=%d, key_len=%d, best_match_node=%s, "
+                "last_host_node=%s, last_device_node=%s",
+                _dbg_req_rid,
+                len(result.device_indices),
+                result.host_hit_length,
+                _dbg_key_len,
+                getattr(result, "best_match_node", "N/A"),
+                getattr(result, "last_host_node", "N/A"),
+                getattr(result, "last_device_node", "N/A"),
+            )
+        # endregion debug-point l3-trace-match-prefix
         return result
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -2004,19 +2043,57 @@ class UnifiedRadixCache(BasePrefixCache):
         assert req is not None
         last_best_match_device_node_id = req.last_node
 
-        if (
-            self.tree_core.is_full_device_evicted(best_match_node_id)
-            or params.host_hit_length > 0
-            or (
-                req is not None
-                and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
+        # region debug-point l3-trace-init-load-back
+        try:
+            _dbg_rank0 = (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_rank() == 0
             )
+        except Exception:
+            _dbg_rank0 = True
+        _dbg_rid = getattr(req, "rid", "N/A")
+        _dbg_is_evicted = self.tree_core.is_full_device_evicted(best_match_node_id)
+        _dbg_cond_host_hit = params.host_hit_length > 0
+        _dbg_cond_swa_mamba = (
+            req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0
+        )
+        _dbg_triggered = (
+            _dbg_is_evicted or _dbg_cond_host_hit or _dbg_cond_swa_mamba
+        )
+        if _dbg_rank0:
+            logger.info(
+                "[L3-DBG][init_load_back ENTER] rid=%s, best_match_node=%s, "
+                "host_hit=%d, swa_host_hit=%d, mamba_host_hit=%d, "
+                "is_full_device_evicted=%s, triggered=%s",
+                _dbg_rid,
+                best_match_node_id,
+                params.host_hit_length,
+                req.swa_host_hit_length,
+                req.mamba_host_hit_length,
+                _dbg_is_evicted,
+                _dbg_triggered,
+            )
+        # endregion debug-point l3-trace-init-load-back
+
+        if (
+            _dbg_is_evicted
+            or _dbg_cond_host_hit
+            or _dbg_cond_swa_mamba
         ):
             if self.load_back(best_match_node_id, mem_quota, req=req):
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
                 )
                 if new_indices.numel() == 0:
+                    # region debug-point l3-trace-init-load-back
+                    if _dbg_rank0:
+                        logger.info(
+                            "[L3-DBG][init_load_back] rid=%s, load_back returned "
+                            "True but new_indices empty",
+                            _dbg_rid,
+                        )
+                    # endregion debug-point l3-trace-init-load-back
                     return (
                         self.tree_core.empty_match_result.device_indices,
                         last_best_match_device_node_id,
@@ -2027,7 +2104,34 @@ class UnifiedRadixCache(BasePrefixCache):
                     len(new_indices),
                     best_match_node_id,
                 )
+                # region debug-point l3-trace-init-load-back
+                if _dbg_rank0:
+                    logger.info(
+                        "[L3-DBG][init_load_back SUCCESS] rid=%s, "
+                        "loaded_tokens=%d, best_match_node=%s",
+                        _dbg_rid,
+                        len(new_indices),
+                        best_match_node_id,
+                    )
+                # endregion debug-point l3-trace-init-load-back
                 return new_indices, best_match_node_id
+            # region debug-point l3-trace-init-load-back
+            if _dbg_rank0:
+                logger.info(
+                    "[L3-DBG][init_load_back] rid=%s, triggered=True but "
+                    "load_back() returned False",
+                    _dbg_rid,
+                )
+            # endregion debug-point l3-trace-init-load-back
+
+        # region debug-point l3-trace-init-load-back
+        if _dbg_rank0 and _dbg_triggered is False:
+            logger.info(
+                "[L3-DBG][init_load_back SKIP] rid=%s, all conditions false, "
+                "skipping load_back (no host_hit, not evicted, no swa/mamba)",
+                _dbg_rid,
+            )
+        # endregion debug-point l3-trace-init-load-back
 
         return (
             self.tree_core.empty_match_result.device_indices,
