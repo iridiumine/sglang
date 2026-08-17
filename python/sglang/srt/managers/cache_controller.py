@@ -869,6 +869,20 @@ class HiCacheController:
             raise ValueError("Other eviction policies are not supported yet.")
 
         self.mem_pool_host.free(host_indices)
+        # INFO-level L2 host eviction log for L3 cache debugging
+        try:
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_rank() == 0
+            ):
+                logger.info(
+                    "[L2-EVICT] freed_tokens=%d, host_avail_after=%d",
+                    len(host_indices),
+                    self.mem_pool_host.available_size(),
+                )
+        except Exception:
+            pass
         return len(host_indices)
 
     def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
@@ -1073,6 +1087,25 @@ class HiCacheController:
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
+        # INFO-level L3 storage hit query summary
+        try:
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_rank() == 0
+            ):
+                logger.info(
+                    "[L3-HIT-QUERY] op=%s, total_pages=%d, hit_pages=%d, "
+                    "hit_tokens=%d, hit_ratio=%.2f",
+                    operation.request_id,
+                    len(page_hashes),
+                    len(hash_value),
+                    storage_query_count,
+                    storage_query_count / max(len(page_hashes) * self.page_size, 1),
+                )
+        except Exception:
+            pass
+
         return hash_value, storage_query_count
 
     def prefetch_thread_func(self):
@@ -1107,6 +1140,22 @@ class HiCacheController:
                     : (storage_hit_count // self.page_size)
                 ]
                 operation.storage_hit_count = storage_hit_count
+                # INFO-level TP-synced L3 hit count for L3 cache debugging
+                try:
+                    if (
+                        torch.distributed.is_available()
+                        and torch.distributed.is_initialized()
+                        and torch.distributed.get_rank() == 0
+                    ):
+                        logger.info(
+                            "[L3-PREFETCH-SYNC] op=%s, TP-synced hit_tokens=%d, "
+                            "hit_pages=%d",
+                            operation.request_id,
+                            storage_hit_count,
+                            len(operation.hash_value),
+                        )
+                except Exception:
+                    pass
                 self.prefetch_hit_queue.put(operation)
 
             except Empty:
@@ -1250,6 +1299,27 @@ class HiCacheController:
                         f"[L3-BACKUP] Backed up {len(operation.hash_value) if operation.hash_value else 0} "
                         f"pages to storage for op {operation.id}."
                     )
+                    # INFO-level L3 backup completion log
+                    try:
+                        if (
+                            torch.distributed.is_available()
+                            and torch.distributed.is_initialized()
+                            and torch.distributed.get_rank() == 0
+                        ):
+                            backed_pages = (
+                                len(operation.hash_value)
+                                if operation.hash_value
+                                else 0
+                            )
+                            logger.info(
+                                "[L3-BACKUP-DONE] op_id=%d, backed_pages=%d, "
+                                "backed_tokens=%d",
+                                operation.id,
+                                backed_pages,
+                                backed_pages * self.page_size,
+                            )
+                    except Exception:
+                        pass
                 self.ack_backup_queue.put(operation)
 
             except Empty:

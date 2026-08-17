@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+﻿﻿from __future__ import annotations
 
 import atexit
 import heapq
@@ -657,7 +657,7 @@ class HiRadixCache(RadixCache):
                     : alloc_len // self.page_size
                 ]
                 operation.host_indices = host_indices
-                logger.debug(
+                logger.info(
                     f"[L3-HIT] Prefetching {len(operation.hash_value)} pages "
                     f"({operation.storage_hit_count} tokens) for request {req_id}."
                 )
@@ -876,6 +876,22 @@ class HiRadixCache(RadixCache):
                 node.id,
                 write_back,
             )
+            # INFO-level D->H backup log for L3 cache debugging
+            try:
+                if (
+                    torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                    and torch.distributed.get_rank() == 0
+                ):
+                    logger.info(
+                        "[HiCache][write_backup D->H] backed_up=%d tokens, "
+                        "node_id=%d, write_back=%s",
+                        len(host_indices),
+                        node.id,
+                        write_back,
+                    )
+            except Exception:
+                pass
         else:
             return 0
 
@@ -958,6 +974,22 @@ class HiRadixCache(RadixCache):
             node.id,
             operation_id,
         )
+        # INFO-level H->L3 backup log for L3 cache debugging
+        try:
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_rank() == 0
+            ):
+                logger.info(
+                    "[HiCache][write_backup_storage H->L3] backed_up=%d tokens, "
+                    "node_id=%d, op_id=%d",
+                    len(host_value),
+                    node.id,
+                    operation_id,
+                )
+        except Exception:
+            pass
 
     def _concat_split_chain(self, node: TreeNode, backup_len: int):
         """Recover enqueue-time key/hash/host by walking the split chain."""
@@ -1847,6 +1879,24 @@ class HiRadixCache(RadixCache):
             host_hit_length,
             last_host_node.id,
         )
+        # INFO-level L1/L2 hit summary for L3 cache debugging
+        try:
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_rank() == 0
+            ):
+                logger.info(
+                    "[HiCache][match_prefix] L1_device_hit=%d, L2_host_hit=%d, "
+                    "key_len=%d, node_id=%d, backuped=%s",
+                    len(value),
+                    host_hit_length,
+                    len(key),
+                    last_host_node.id,
+                    last_host_node.backuped,
+                )
+        except Exception:
+            pass
 
         return MatchResult(
             device_indices=value,
@@ -1888,6 +1938,24 @@ class HiRadixCache(RadixCache):
                 self.enable_storage,
                 self.cache_controller.prefetch_rate_limited(),
             )
+            # INFO-level skip log (only enable_storage case is interesting for L3 debug)
+            try:
+                if (
+                    self.enable_storage
+                    and torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                    and torch.distributed.get_rank() == 0
+                ):
+                    logger.info(
+                        "[HiCache][prefetch_from_storage SKIP] req_id=%s, "
+                        "prefetch_length=%d < threshold=%d, rate_limited=%s",
+                        req_id,
+                        prefetch_length,
+                        self.prefetch_threshold,
+                        self.cache_controller.prefetch_rate_limited(),
+                    )
+            except Exception:
+                pass
             return
 
         last_host_node.protect_host()
@@ -1909,6 +1977,23 @@ class HiRadixCache(RadixCache):
             last_host_node.id,
             self.cache_controller.mem_pool_host.available_size(),
         )
+        # INFO-level prefetch issued log for L3 cache debugging
+        try:
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_rank() == 0
+            ):
+                logger.info(
+                    "[HiCache][prefetch_from_storage ISSUED] req_id=%s, "
+                    "prefetch_length=%d, node_id=%d, host_avail=%d",
+                    req_id,
+                    prefetch_length,
+                    last_host_node.id,
+                    self.cache_controller.mem_pool_host.available_size(),
+                )
+        except Exception:
+            pass
         self.ongoing_prefetch[req_id] = (
             last_host_node,
             prefetch_key,

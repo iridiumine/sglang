@@ -37,6 +37,22 @@ SETUP_TIMEOUT = 600  # seconds
 
 logger = logging.getLogger(__name__)
 
+
+def _should_log_rank0() -> bool:
+    """Only log L3 storage operations from TP rank 0 to avoid spam."""
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank() == 0
+    except Exception:
+        pass
+    return True
+
+
+def _log_l3(msg, *args, level=logging.INFO):
+    """Log L3 storage operations only from rank 0."""
+    if _should_log_rank0():
+        logger.log(level, msg, *args)
+
 # Keys handled by SGLang only; not applied to memcache_hybrid.LocalConfig.
 _MEMCACHE_CTRL_KEYS = frozenset(
     {
@@ -641,7 +657,13 @@ class AscendMemcacheStore(HiCacheStorage):
                 len(keys) / (end_time - start_time) * self.gb_per_page
             )
 
-        return self._batch_postprocess(get_results, is_set_operate=False)
+        page_results = self._batch_postprocess(get_results, is_set_operate=False)
+        hit_pages = sum(1 for r in page_results if r)
+        _log_l3(
+            "[L3-GET-v1] pages=%d, hit_pages=%d, elapsed=%.3fs",
+            len(keys), hit_pages, end_time - start_time,
+        )
+        return page_results
 
     def batch_set_v1(
         self,
@@ -689,6 +711,12 @@ class AscendMemcacheStore(HiCacheStorage):
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]
         page_results = self._batch_postprocess(set_results, is_set_operate=True)
+        ok_pages = sum(1 for r in page_results if r)
+        _log_l3(
+            "[L3-SET-v1] pages=%d, existing=%d, new=%d, ok=%d, elapsed=%.3fs",
+            len(keys), existing_keys, len(set_keys), ok_pages,
+            end_time - start_time if set_keys else 0.0,
+        )
         return page_results
 
     def set(
@@ -763,6 +791,11 @@ class AscendMemcacheStore(HiCacheStorage):
             if exist_result[i] == 0:
                 break
             success_count += 1
+        _log_l3(
+            "[L3-SET] total_keys=%d, new_keys=%d, success=%d/%d, elapsed=%.3fs",
+            len(keys), len(set_keys), success_count, len(keys),
+            end_time - start_time,
+        )
         return success_count == len(keys)
 
     def get(
@@ -807,8 +840,18 @@ class AscendMemcacheStore(HiCacheStorage):
 
         for i in range(len(keys)):
             if get_result[i] < 0:
-                return i // key_multiplier
-        return len(keys) // key_multiplier
+                hit_pages = i // key_multiplier
+                _log_l3(
+                    "[L3-GET] keys=%d, hit_pages=%d, elapsed=%.3fs (partial)",
+                    len(keys), hit_pages, end_time - start_time,
+                )
+                return hit_pages
+        hit_pages = len(keys) // key_multiplier
+        _log_l3(
+            "[L3-GET] keys=%d, hit_pages=%d, elapsed=%.3fs (all success)",
+            len(keys), hit_pages, end_time - start_time,
+        )
+        return hit_pages
 
     def exists(self, key: str) -> bool:
         exist_result = self._batch_exist([key])
@@ -848,8 +891,19 @@ class AscendMemcacheStore(HiCacheStorage):
             hit_component_keys += 1
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
-                return i // key_multiplier
-        return len(query_keys) // key_multiplier
+                hit_pages = i // key_multiplier
+                _log_l3(
+                    "[L3-EXISTS] query_pages=%d, hit_pages=%d, hit_ratio=%.2f",
+                    len(keys), hit_pages,
+                    hit_pages / max(len(keys), 1),
+                )
+                return hit_pages
+        hit_pages = len(query_keys) // key_multiplier
+        _log_l3(
+            "[L3-EXISTS] query_pages=%d, hit_pages=%d, hit_ratio=1.00 (all hit)",
+            len(keys), hit_pages,
+        )
+        return hit_pages
 
     def clear(self) -> None:
         self.store.remove_all()
