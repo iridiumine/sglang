@@ -2686,34 +2686,6 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
-            # region debug-point l3-trace-prefetch-kvcache
-            try:
-                _dbg_rank0 = (
-                    torch.distributed.is_available()
-                    and torch.distributed.is_initialized()
-                    and torch.distributed.get_rank() == 0
-                )
-            except Exception:
-                _dbg_rank0 = True
-            if _dbg_rank0:
-                logger.info(
-                    "[L3-DBG][_prefetch_kvcache] rid=%s, prefix_indices=%d, "
-                    "host_hit_length=%d, last_host_node=%s, "
-                    "is_backuped=%s, is_root=%s, "
-                    "full_untruncated_fill_ids=%d",
-                    getattr(req, "rid", "N/A"),
-                    len(req.prefix_indices),
-                    req.host_hit_length,
-                    getattr(req, "last_host_node", "N/A"),
-                    tree_cache.is_backuped(req.last_host_node)
-                    if req.last_host_node is not None
-                    else "N/A",
-                    tree_cache.is_root(req.last_host_node)
-                    if req.last_host_node is not None
-                    else "N/A",
-                    len(req.full_untruncated_fill_ids),
-                )
-            # endregion debug-point l3-trace-prefetch-kvcache
             if tree_cache.is_backuped(req.last_host_node) or tree_cache.is_root(
                 req.last_host_node
             ):
@@ -2722,18 +2694,6 @@ class Scheduler(
                     len(req.full_untruncated_fill_ids)
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
-                # region debug-point l3-trace-prefetch-kvcache
-                if _dbg_rank0:
-                    logger.info(
-                        "[L3-DBG][_prefetch_kvcache ISSUED] rid=%s, "
-                        "matched_len=%d, match_end=%d, "
-                        "new_input_tokens_len=%d",
-                        getattr(req, "rid", "N/A"),
-                        matched_len,
-                        match_end,
-                        len(new_input_tokens),
-                    )
-                # endregion debug-point l3-trace-prefetch-kvcache
                 prefix_keys = (
                     tree_cache.get_prefix_hash_values(req.last_host_node)
                     if tree_cache.hicache_storage_pass_prefix_keys
@@ -3667,6 +3627,19 @@ class Scheduler(
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
 
+        dbg_is_decode = batch.forward_mode.is_decode()
+        if dbg_is_decode:
+            try:
+                dbg_rank = torch.distributed.get_rank()
+            except Exception:
+                dbg_rank = -1
+            logger.info(
+                "[DBG-DECODE-START] rank=%d iter=%d ts=%.3f",
+                dbg_rank,
+                self.forward_ct,
+                batch.launch_ts,
+            )
+
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
 
@@ -3871,6 +3844,14 @@ class Scheduler(
                 )
 
         self._maybe_report_active_ranks()
+
+        if dbg_is_decode:
+            logger.info(
+                "[DBG-DECODE-END] rank=%d iter=%d dur_ms=%.1f",
+                dbg_rank,
+                self.forward_ct,
+                (time.monotonic() - batch.launch_ts) * 1e3,
+            )
 
         return ret
 

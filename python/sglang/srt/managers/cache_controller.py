@@ -1047,7 +1047,20 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                dbg_t0 = time.monotonic()
                 self._page_transfer(operation)
+                try:
+                    dbg_rank = torch.distributed.get_rank()
+                except Exception:
+                    dbg_rank = -1
+                logger.info(
+                    "[DBG-PREFETCH-DMA] rank=%d req=%s completed_tokens=%d "
+                    "elapsed_ms=%.1f",
+                    dbg_rank,
+                    operation.request_id,
+                    operation.completed_tokens,
+                    (time.monotonic() - dbg_t0) * 1e3,
+                )
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
                     operation.host_indices[operation.completed_tokens :]
