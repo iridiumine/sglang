@@ -924,8 +924,19 @@ class UnifiedRadixCache(BasePrefixCache):
         self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
     ) -> int:
         """Evict host resources for a specific component to free host pool space."""
+        logger.info(
+            "[L2 evict] evict_host requested: num_tokens=%d component=%s",
+            num_tokens,
+            component_type,
+        )
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._free_values(result.device_frees, result.host_frees)
+        logger.info(
+            "[L2 evict] evict_host done: component=%s freed=%d (requested=%d)",
+            component_type,
+            result.tracker.get(component_type, 0),
+            num_tokens,
+        )
         return result.tracker.get(component_type, 0)
 
     # ---- HiCache: Backup / LoadBack ----

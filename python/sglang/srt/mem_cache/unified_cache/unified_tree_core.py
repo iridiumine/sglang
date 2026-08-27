@@ -1448,6 +1448,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
 
         self._record_remove_event(node, medium=StorageMedium.CPU)
+        host_freed_before = {ct: tracker.get(ct, 0) for ct in tracker}
         for comp in self.components:
             _, hf = self._evict_component_and_detach_lru(
                 node,
@@ -1461,6 +1462,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.evictable_host_leaves.discard(node)
         self._remove_leaf_from_parent(node)
         self._iteratively_delete_tombstone_leaf(node, tracker, device_frees, host_frees)
+        logger.info(
+            "[L2 evict] host leaf evicted: node_id=%s tokens=%s",
+            node.id,
+            {
+                comp.component_type: tracker.get(comp.component_type, 0)
+                - host_freed_before.get(comp.component_type, 0)
+                for comp in self.components
+            },
+        )
 
     def demote(self, node_id: NodeId) -> DemoteResult:
         """Release a node's device KV once its host copy exists; the node stays in the
