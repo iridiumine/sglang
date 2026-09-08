@@ -19,6 +19,28 @@ MXFP8_BLOCK_SIZE = 32
 MXFP4_BLOCK_SIZE = 32
 
 
+def _dequant_e4m3fn_to_float32(u8: torch.Tensor) -> torch.Tensor:
+    """Decode float8_e4m3fn payload bytes to FP32 by explicit bit layout.
+
+    Direct ``.to(torch.float32)`` on NPU fp8 tensors fails on some CANN builds
+    (aclnnInplaceCopy error 561103), so decode manually. Only used at
+    weight-load time (and the defensive pre-quantized-input path), where the
+    handful of extra elementwise ops is irrelevant.
+    """
+    bits = u8.view(torch.uint8).to(torch.int32)
+    sign = torch.where(bits >= 0x80, -1.0, 1.0)
+    e = ((bits >> 3) & 0xF).to(torch.float32)
+    m = (bits & 0x7).to(torch.float32)
+    mag = torch.where(
+        e == 0.0,
+        m * (1.0 / 512.0),  # subnormal: m * 2^-9
+        (1.0 + m / 8.0) * torch.pow(2.0, e - 7.0),
+    )
+    # e4m3fn reserves S.1111.111 for NaN (no infinities); max finite is 448.
+    mag = torch.where((e == 15.0) & (m == 7.0), float("nan"), mag)
+    return sign * mag
+
+
 # NPU ops are reached via torch.ops.npu.* (registered when torch_npu is imported
 # by the runtime), so this module needs no top-level `import torch_npu` and stays
 # importable on CUDA/CPU/AMD/XPU CI.
@@ -884,3 +906,104 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
         # Restore original shape (replace last dim with output features).
         output_shape = list(input_shape[:-1]) + [output.shape[-1]]
         return output.reshape(output_shape)
+
+
+class NPUBlockFP8LinearMethod(_NPULinearMethodBase):
+    """NPU block-FP8 (e.g. 128x128) dense linear — dequant-to-BF16 route.
+
+    On NPU the generic ``Fp8LinearMethod`` dispatches ``w8a8_block_fp8_linear``
+    to the CUDA Triton tile GEMM, which cannot use the NPU Cube units and runs
+    far slower than a native matmul (verified by profiling). Until a native W8A8
+    block-scale GEMM lands, dequantise the FP8 weights once at load time
+    (fp8 weight * expanded block scale -> BF16) and run a plain BF16 matmul.
+
+    Trade-off: 2x weight memory for dense layers, in exchange for native Cube
+    throughput. Weight creation is delegated to ``Fp8LinearMethod.create_fp8_weight_``
+    so checkpoint loading (fp8 payload + ``weight_scale_inv`` [N//bn, K//bk]) is
+    unchanged; only ``process_weights_after_loading`` differs.
+    """
+
+    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+        super().__init__(quant_config)
+        self.weight_block_size = quant_config.weight_block_size
+        self.is_checkpoint_fp8_serialized = (
+            quant_config.is_checkpoint_fp8_serialized
+        )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes,
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+        Fp8LinearMethod.create_fp8_weight_(
+            layer,
+            block_quant=True,
+            quant_config=self.quant_config,
+            use_mxfp8=False,
+            output_size_per_partition=sum(output_partition_sizes),
+            input_size_per_partition=input_size_per_partition,
+            output_partition_sizes=output_partition_sizes,
+            weight_loader=extra_weight_attrs.get("weight_loader"),
+            input_size=input_size,
+            output_size=output_size,
+            is_checkpoint_fp8_serialized=self.is_checkpoint_fp8_serialized,
+            params_dtype=params_dtype,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        weight = layer.weight.data
+        if weight.dtype in (torch.float16, torch.bfloat16):
+            # Unquantized checkpoint — keep as-is, apply() runs a plain matmul.
+            return
+
+        block_n, block_k = self.weight_block_size
+        n, k = weight.shape
+        dtype = getattr(layer, "orig_dtype", None) or torch.bfloat16
+        if not weight.is_npu:
+            weight = weight.to(f"npu:{torch.npu.current_device()}")
+        scale = layer.weight_scale_inv.data
+
+        out = torch.empty(n, k, dtype=dtype, device=weight.device)
+        # Row-chunked (block-aligned) dequant to bound the FP32 transient at
+        # ~1k rows instead of materialising the whole FP32 weight at once.
+        rows_per_chunk = block_n * max(1, 1024 // block_n)
+        for r0 in range(0, n, rows_per_chunk):
+            r1 = min(r0 + rows_per_chunk, n)
+            s = scale[r0 // block_n : (r1 + block_n - 1) // block_n]
+            s = (
+                s.repeat_interleave(block_n, dim=0)[: r1 - r0]
+                .repeat_interleave(block_k, dim=1)[:, :k]
+            )
+            # Explicit bit decode: direct .to(float32) on fp8 NPU tensors fails
+            # on some CANN builds (aclnnInplaceCopy error 561103).
+            out[r0:r1] = (_dequant_e4m3fn_to_float32(weight[r0:r1]) * s).to(dtype)
+
+        layer.weight = Parameter(out, requires_grad=False)
+        # Keep weight_scale_inv registered (tiny) so hot reload / any external
+        # reader of the parameter still finds it.
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if isinstance(x, tuple):
+            # Pre-quantized (fp8 payload, per-group scale[, orig_dtype]) input
+            # from a fused norm+quant kernel: dequantise back before the BF16
+            # GEMM. Scale layout is row-major (M, cdiv(K, group)).
+            qx, x_scale = x[0], x[1]
+            orig_dtype = x[2] if len(x) > 2 else torch.bfloat16
+            group = self.weight_block_size[1]
+            x = (
+                _dequant_e4m3fn_to_float32(qx)
+                * x_scale.repeat_interleave(group, dim=1)[..., : qx.shape[-1]]
+            ).to(orig_dtype)
+        return torch.nn.functional.linear(x, layer.weight, bias)

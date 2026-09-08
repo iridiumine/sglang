@@ -372,6 +372,14 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return NPUMXFP8LinearMethod(self)
+            if is_npu() and self.weight_block_size is not None:
+                # Block-FP8 (128x128) dense linear: the generic Triton tile GEMM
+                # cannot use NPU Cube units, so dequantise to BF16 instead.
+                from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                    NPUBlockFP8LinearMethod,
+                )
+
+                return NPUBlockFP8LinearMethod(self)
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             if is_layer_skipped(
