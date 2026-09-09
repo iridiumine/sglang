@@ -923,6 +923,11 @@ class Envs:
     # to MXFP8 at load time and run the native quantised GEMM instead of
     # dequantising to BF16 (route A) — halves weight memory.
     SGLANG_NPU_BLOCK_FP8_REQUANT_MXFP8 = EnvBool(False)
+    # Fuse the MXFP4 W4A8 MoE chain (gmm1 + swiglu + requant) into the single
+    # npu_grouped_matmul_swiglu_quant_v2 kernel (FP4 weights verified on A5,
+    # see llm/probe_mxfp4_gmm_swiglu_quant.py). Default off until validated
+    # end-to-end on A5.
+    SGLANG_NPU_MXFP4_FUSED_SWIGLU = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
