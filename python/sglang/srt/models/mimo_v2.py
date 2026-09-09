@@ -350,9 +350,11 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
-        self.dtype = torch.float32
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size),
+                dtype=torch.bfloat16,
+            )
         )
         if config.topk_method == "noaux_tc":
             correction_bias_dtype = (
@@ -360,7 +362,7 @@ class MoEGate(nn.Module):
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
                 and get_moe_runner_backend().is_flashinfer_trtllm()
-                else self.dtype
+                else torch.bfloat16
             )
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
@@ -369,7 +371,7 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        logits = F.linear(hidden_states, self.weight, None)
 
         return logits
 
