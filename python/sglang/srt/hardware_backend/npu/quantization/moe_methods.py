@@ -199,7 +199,7 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         # (llm/probe_mxfp4_gmm_swiglu_quant.py: same numerics as the unfused
         # chain modulo the output fp8 requant, which the unfused chain also
         # applies before gmm2). Opt-in until validated end-to-end.
-        self.use_fused_gmm1 = envs.SGLANG_NPU_MXFP4_FUSED_SWIGLU
+        self.use_fused_gmm1 = envs.SGLANG_NPU_MXFP4_FUSED_SWIGLU.get()
         self.fused_matmul = GroupedMatmulSwigluQuant()
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(
             quant_dtype=torch.float8_e4m3fn
