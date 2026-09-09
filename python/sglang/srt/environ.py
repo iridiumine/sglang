@@ -919,6 +919,10 @@ class Envs:
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
+    # Route B1 for NPU block-FP8 (128x128) dense linears: requantise weights
+    # to MXFP8 at load time and run the native quantised GEMM instead of
+    # dequantising to BF16 (route A) — halves weight memory.
+    SGLANG_NPU_BLOCK_FP8_REQUANT_MXFP8 = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"

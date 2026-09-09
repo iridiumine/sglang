@@ -926,9 +926,7 @@ class NPUBlockFP8LinearMethod(_NPULinearMethodBase):
     def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
         super().__init__(quant_config)
         self.weight_block_size = quant_config.weight_block_size
-        self.is_checkpoint_fp8_serialized = (
-            quant_config.is_checkpoint_fp8_serialized
-        )
+        self.is_checkpoint_fp8_serialized = quant_config.is_checkpoint_fp8_serialized
 
     def create_weights(
         self,
@@ -977,10 +975,9 @@ class NPUBlockFP8LinearMethod(_NPULinearMethodBase):
         for r0 in range(0, n, rows_per_chunk):
             r1 = min(r0 + rows_per_chunk, n)
             s = scale[r0 // block_n : (r1 + block_n - 1) // block_n]
-            s = (
-                s.repeat_interleave(block_n, dim=0)[: r1 - r0]
-                .repeat_interleave(block_k, dim=1)[:, :k]
-            )
+            s = s.repeat_interleave(block_n, dim=0)[: r1 - r0].repeat_interleave(
+                block_k, dim=1
+            )[:, :k]
             # Explicit bit decode: direct .to(float32) on fp8 NPU tensors fails
             # on some CANN builds (aclnnInplaceCopy error 561103).
             out[r0:r1] = (_dequant_e4m3fn_to_float32(weight[r0:r1]) * s).to(dtype)
@@ -1007,3 +1004,178 @@ class NPUBlockFP8LinearMethod(_NPULinearMethodBase):
                 * x_scale.repeat_interleave(group, dim=1)[..., : qx.shape[-1]]
             ).to(orig_dtype)
         return torch.nn.functional.linear(x, layer.weight, bias)
+
+
+class NPUBlockFP8RequantMXFP8LinearMethod(_NPULinearMethodBase):
+    """NPU block-FP8 (128x128) dense linear — route B1: requantise to MXFP8.
+
+    Alternative to ``NPUBlockFP8LinearMethod`` (route A, dequant-to-BF16) that
+    keeps the weight at 1 byte: at load time, dequantise the checkpoint's
+    block-FP8 weight (fp8 payload * 128x128 fp32 scale) to BF16, then requantise
+    to MXFP8 (fp8 payload + 1x32 UE8M0 block scale via npu_dynamic_mx_quant).
+    Inference then runs the exact production MXFP8 chain
+    (NPUMXFP8LinearMethod.apply): dynamic MXFP8 activation quant +
+    npu_quant_matmul(group_sizes=[1, 1, 32]).
+
+    Rationale (probed on A5, see llm/probe_blockfp8_w8a8_dense.py):
+    npu_quant_matmul rejects 128-group scales (aclnnQuantMatmulV5 error
+    161002) while the gs=[1,1,32] MX convention runs with rel_err ~2e-3, so a
+    native W8A8 block-FP8 GEMM does not exist; requantising to MXFP8 is the
+    only native quantised path.
+
+    Trade-off vs route A: weight memory back to ~1/2 (1 byte + tiny scale), at
+    the cost of double weight quantisation (128x128 fp32 scale -> 1x32 e8m0)
+    and e8m0 activation quant — needs a GSM8K regression.
+
+    Opt-in via SGLANG_NPU_BLOCK_FP8_REQUANT_MXFP8=1; route A stays the default.
+    """
+
+    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+        super().__init__(quant_config)
+        self.weight_block_size = quant_config.weight_block_size
+        self.is_checkpoint_fp8_serialized = quant_config.is_checkpoint_fp8_serialized
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes,
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+        # Same checkpoint layout as route A (fp8 payload + 128x128 fp32 scale);
+        # only process_weights_after_loading differs.
+        Fp8LinearMethod.create_fp8_weight_(
+            layer,
+            block_quant=True,
+            quant_config=self.quant_config,
+            use_mxfp8=False,
+            output_size_per_partition=sum(output_partition_sizes),
+            input_size_per_partition=input_size_per_partition,
+            output_partition_sizes=output_partition_sizes,
+            weight_loader=extra_weight_attrs.get("weight_loader"),
+            input_size=input_size,
+            output_size=output_size,
+            is_checkpoint_fp8_serialized=self.is_checkpoint_fp8_serialized,
+            params_dtype=params_dtype,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        weight = layer.weight.data
+        if weight.dtype in (torch.float16, torch.bfloat16):
+            # Unquantized checkpoint: quantise straight to MXFP8.
+            if not weight.is_npu:
+                weight = weight.to(f"npu:{torch.npu.current_device()}")
+            bf16 = (
+                weight if weight.dtype == torch.bfloat16 else weight.to(torch.bfloat16)
+            )
+        else:
+            # Step 1: dequantise block-FP8 -> BF16 (same chunked logic as
+            # route A; duplicated deliberately so route A stays untouched).
+            block_n, block_k = self.weight_block_size
+            n, k = weight.shape
+            if not weight.is_npu:
+                weight = weight.to(f"npu:{torch.npu.current_device()}")
+            scale = layer.weight_scale_inv.data
+
+            bf16 = torch.empty(n, k, dtype=torch.bfloat16, device=weight.device)
+            rows_per_chunk = block_n * max(1, 1024 // block_n)
+            for r0 in range(0, n, rows_per_chunk):
+                r1 = min(r0 + rows_per_chunk, n)
+                s = scale[r0 // block_n : (r1 + block_n - 1) // block_n]
+                s = s.repeat_interleave(block_n, dim=0)[: r1 - r0].repeat_interleave(
+                    block_k, dim=1
+                )[:, :k]
+                # Explicit bit decode: direct .to(float32) on fp8 NPU tensors
+                # fails on some CANN builds (aclnnInplaceCopy error 561103).
+                bf16[r0:r1] = (_dequant_e4m3fn_to_float32(weight[r0:r1]) * s).to(
+                    torch.bfloat16
+                )
+
+        # Step 2: requantise BF16 -> MXFP8 (1x32 e8m0 block scale).
+        qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            bf16, dst_type=torch.float8_e4m3fn
+        )
+
+        # Layout mirrors NPUMXFP8LinearMethod: weight [in, out] and scale
+        # [in//64, out, 2] as strided transpose views — DO NOT call
+        # .contiguous() (see that class for the bandwidth rationale).
+        layer.weight = Parameter(qw.transpose(0, 1), requires_grad=False)
+        if w_scale.dim() == 2:
+            # Older torch_npu builds return [out, in//32]; reshape to 3D.
+            n_s, k_s = w_scale.shape
+            w_scale = w_scale.reshape(n_s, k_s // 2, 2)
+        layer.weight_scale_inv = Parameter(w_scale.transpose(0, 1), requires_grad=False)
+
+        # Cache FP32 bias once (same as NPUMXFP8LinearMethod).
+        if (
+            getattr(layer, "bias", None) is not None
+            and layer.bias.dtype != torch.float32
+        ):
+            layer.bias_fp32 = Parameter(
+                layer.bias.data.to(torch.float32), requires_grad=False
+            )
+        else:
+            layer.bias_fp32 = None
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if isinstance(x, tuple):
+            # Pre-quantized (fp8 payload, per-group-128 scale[, orig_dtype])
+            # input from a fused norm+quant kernel: dequantise back to BF16,
+            # then requantise to MXFP8 below. Scale layout is row-major
+            # (M, cdiv(K, group)).
+            qx, x_scale = x[0], x[1]
+            orig_dtype = x[2] if len(x) > 2 else torch.bfloat16
+            group = self.weight_block_size[1]
+            x = (
+                _dequant_e4m3fn_to_float32(qx)
+                * x_scale.repeat_interleave(group, dim=1)[..., : qx.shape[-1]]
+            ).to(orig_dtype)
+
+        # Inference chain: identical to NPUMXFP8LinearMethod.apply.
+        original_dtype = x.dtype
+        if original_dtype not in (torch.float16, torch.bfloat16):
+            x = x.to(torch.bfloat16)
+            original_dtype = torch.bfloat16
+
+        input_shape = x.shape
+        x_2d = x.reshape(-1, x.shape[-1])
+
+        qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            x_2d, dst_type=torch.float8_e4m3fn
+        )
+
+        if bias is None:
+            quant_bias = None
+        elif (
+            bias is getattr(layer, "bias", None)
+            and getattr(layer, "bias_fp32", None) is not None
+        ):
+            quant_bias = layer.bias_fp32
+        else:
+            quant_bias = bias.to(torch.float32)
+
+        e8m0_dtype = _get_float8_e8m0fnu_dtype()
+        output = torch.ops.npu.npu_quant_matmul(
+            qx,
+            layer.weight,
+            layer.weight_scale_inv,
+            scale_dtype=e8m0_dtype,
+            pertoken_scale=input_scale,
+            pertoken_scale_dtype=e8m0_dtype,
+            bias=quant_bias,
+            output_dtype=original_dtype,
+            group_sizes=[1, 1, MXFP8_BLOCK_SIZE],
+        )
+
+        output_shape = list(input_shape[:-1]) + [output.shape[-1]]
+        return output.reshape(output_shape)

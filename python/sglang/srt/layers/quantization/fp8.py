@@ -373,8 +373,18 @@ class Fp8Config(QuantizationConfig):
 
                 return NPUMXFP8LinearMethod(self)
             if is_npu() and self.weight_block_size is not None:
-                # Block-FP8 (128x128) dense linear: the generic Triton tile GEMM
-                # cannot use NPU Cube units, so dequantise to BF16 instead.
+                if envs.SGLANG_NPU_BLOCK_FP8_REQUANT_MXFP8.get():
+                    # Route B1: requantise block-FP8 weights to MXFP8 at load
+                    # time and run the native quantised (W8A8) MXFP8 GEMM —
+                    # halves weight memory vs route A at some accuracy cost.
+                    from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                        NPUBlockFP8RequantMXFP8LinearMethod,
+                    )
+
+                    return NPUBlockFP8RequantMXFP8LinearMethod(self)
+                # Route A (default): Block-FP8 (128x128) dense linear — the
+                # generic Triton tile GEMM cannot use NPU Cube units, so
+                # dequantise to BF16 instead.
                 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
                     NPUBlockFP8LinearMethod,
                 )
