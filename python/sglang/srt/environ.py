@@ -1258,6 +1258,13 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Experimental: capture the DFLASH draft decode graph even under dp
+    # attention. The dense DFLASH draft runs attn-TP-local (draft_tp_context)
+    # with no cross-DP collective, so -- like the DSpark dense draft -- its
+    # graph can be keyed by local batch size and replayed per DP rank. The
+    # idle-DP ranks simply skip the draft step (no collective to keep in
+    # lockstep). Mirrors the DSpark _forward_is_dp_local exemption.
+    SGLANG_DFLASH_DRAFT_GRAPH_UNDER_DP = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).

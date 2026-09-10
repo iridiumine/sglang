@@ -511,7 +511,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_decode_cuda_graph = (
                 get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             )
-            if get_parallel().enable_dp_attention and capture_decode_cuda_graph:
+            if (
+                get_parallel().enable_dp_attention
+                and capture_decode_cuda_graph
+                and not envs.SGLANG_DFLASH_DRAFT_GRAPH_UNDER_DP.get()
+            ):
                 # The dense DFLASH draft's collectives live inside the per-DP
                 # attn-TP group; idle DP ranks skip the draft step, so they
                 # cannot join a shared graph capture/replay. Keep the draft
@@ -520,7 +524,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 if self.ps.tp_rank == 0:
                     logger.warning(
                         "Disable DFLASH draft cuda graph because dp attention "
-                        "is enabled (draft runs eager)."
+                        "is enabled (draft runs eager). "
+                        "Set SGLANG_DFLASH_DRAFT_GRAPH_UNDER_DP=1 to experiment "
+                        "with the attn-TP-local draft graph (DSpark-style "
+                        "_forward_is_dp_local exemption)."
                     )
             if is_cuda() and capture_decode_cuda_graph:
                 available_mem = self._tp_sync.available_memory_gb(
@@ -2398,6 +2405,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             global_num_token_non_padded_cpu=bs * block_size,
         )
+        # Mirror DSpark's dp-local draft: the dense DFLASH draft runs
+        # attn-TP-local with no cross-DP collective, so under dp attention its
+        # graph eligibility follows the batch's DP graph vote (require_mlp_sync
+        # in can_run_graph checks this flag). Default False on a hand-built
+        # ForwardBatch would permanently block the draft graph replay.
+        forward_batch.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
 
         if self.selector is not None:
             self._selector_sample = None
