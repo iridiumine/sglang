@@ -1105,19 +1105,6 @@ class MiMoV2Model(nn.Module):
                     ),
                 )
 
-        # A draft targeting the final layer maps to capture index
-        # num_hidden_layers, past the layer loop; capture the pre-norm
-        # residual stream here. Clone so the final norm cannot mutate it.
-        if (
-            self.pp_group.is_last_rank
-            and self.config.num_hidden_layers in self.layers_to_capture
-        ):
-            aux_hidden_states.append(
-                (hidden_states + residual).clone()
-                if residual is not None
-                else hidden_states.clone()
-            )
-
         hidden_states_before_norm = None
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -1136,6 +1123,13 @@ class MiMoV2Model(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+
+            # HF reference (output_hidden_states convention): the final-layer
+            # aux entry is the post-final-norm hidden state. Appended
+            # unconditionally (outside the empty-batch guard) so the aux list
+            # stays aligned with the in-loop captures on every rank.
+            if self.config.num_hidden_layers in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states)
 
         if len(aux_hidden_states) == 0:
             return hidden_states, hidden_states_before_norm
