@@ -1618,6 +1618,15 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
+            # Non-DP deployments never run prepare_mlp_sync_batch, the only
+            # eager writer of the ForwardContext flag (graph capture forces
+            # False). Derive it from the forward mode so DeepEP-mode=AUTO
+            # resolves prefill to the normal dispatcher instead of staying
+            # on low-latency — matching the DP path (dp_attn sets it from
+            # forward_mode.is_extend() too).
+            from sglang.srt.layers.dp_attention import set_is_extend_in_batch
+
+            set_is_extend_in_batch(forward_batch.forward_mode.is_extend())
 
         # Derive the LOCAL num_token_non_padded from the GLOBAL scalar. sharded is
         # cleared for DSACPLayerCommunicator-style CP (DSA, MLA): those flavors
