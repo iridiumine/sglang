@@ -280,11 +280,15 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
     """ModelSlim W4A8 MoE with packed MXFP4 weights and MXFP8 activations."""
 
     # Dispatch wire format required by the W4A8 MXFP GMMs: low-latency
-    # dispatch quantizes activations to MXFP8 (E8M0 block scales); normal
-    # dispatch stays BF16 because A5 MXFP8 normal dispatch is intranode-only,
-    # which also preserves multi-node prefill when ``deepep-mode=auto``.
+    # dispatch quantizes activations to MXFP8 (E8M0 block scales). Normal
+    # dispatch stays BF16 by default because A5 MXFP8 normal dispatch is
+    # intranode-only (internode raises in the kernel strategy layer);
+    # SGLANG_NPU_DEEPEP_NORMAL_MXFP8=1 opts into intranode MXFP8 to halve
+    # the dispatch payload and fold quantization into the dispatch kernel.
     DISPATCHER_QUANT_CONFIG = {
-        "normal_dispatcher_output_dtype": "bf16",
+        "normal_dispatcher_output_dtype": (
+            "mxfp8" if envs.SGLANG_NPU_DEEPEP_NORMAL_MXFP8.get() else "bf16"
+        ),
         "low_latency_dispatcher_output_dtype": "mxfp8",
     }
 

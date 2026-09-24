@@ -978,6 +978,11 @@ class Envs:
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
+    # Quantize prefill activations to MXFP8 inside the DeepEP normal dispatch
+    # kernel (A5, intranode EP only): halves the dispatch payload and removes
+    # the separate DynamicMxQuant kernel. Internode EP raises in the kernel
+    # strategy layer — keep the default False for multi-node prefill.
+    SGLANG_NPU_DEEPEP_NORMAL_MXFP8 = EnvBool(False)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
 
