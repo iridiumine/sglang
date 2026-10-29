@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import inspect
 import logging
 import os
@@ -98,12 +99,20 @@ def _is_mnnvl_fabric_supported() -> bool:
     return is_mnnvl_fabric_supported(torch.cuda.current_device())
 
 
+@functools.cache
+def _is_deepgemm_precompile_stage() -> bool:
+    # The flag is set once at process startup (e.g. by compile_deep_gemm before
+    # any forward runs) and never toggled afterwards, so read it lazily on the
+    # first barrier use instead of on every DeepEP call.
+    return envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
+
+
 def _deepep_precompile_tp_barrier() -> None:
     # DeepEP's all-to-all operation has a much shorter timeout compared to torch.distributed,
     # so if different ranks compile at different speeds, it may quickly trigger a timeout.
     # To avoid this, we use torch.distributed's barrier during the compile stage.
     # We apply this barrier only in the compile stage to prevent extra all-reduce overhead at runtime.
-    if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
+    if _is_deepgemm_precompile_stage():
         get_parallel().tp_group.barrier()
 
 
@@ -415,6 +424,14 @@ class _DeepEPDispatcherImplBase:
         self.overlap_args: Optional[CombineOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
 
+        # Host-side caches resolved once instead of on every layer forward:
+        # the DeepEP buffer is a process-wide singleton, and the pybind dispatch
+        # signature never changes within a process. `_cached_quant_kwargs` is
+        # invalidated by `set_deepep_dispatcher_dtype()` whenever the quant
+        # flags change.
+        self._cached_buffer = None
+        self._cached_quant_kwargs: Optional[dict] = None
+
         self.set_deepep_dispatcher_dtype()
 
     def dispatch_a(
@@ -446,6 +463,9 @@ class _DeepEPDispatcherImplBase:
         self.set_deepep_dispatcher_dtype()
 
     def set_deepep_dispatcher_dtype(self) -> None:
+        # The quant kwargs cached by the dispatcher impls are derived from the
+        # flags assigned below, so drop the cache before the flags change.
+        self._cached_quant_kwargs = None
         self.deepep_output_dtype = get_deepep_output_dtype(self)
 
         # Configuration mapping for each dtype
@@ -578,6 +598,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         if not _is_npu:
             return {}
 
+        # The pybind dispatch signature is fixed for the process lifetime and
+        # the flag combination only changes via set_deepep_dispatcher_dtype()
+        # (which resets this cache), so reflect on the signature only once.
+        if self._cached_quant_kwargs is None:
+            self._cached_quant_kwargs = self._resolve_quantization_kwargs(buffer)
+        return self._cached_quant_kwargs
+
+    def _resolve_quantization_kwargs(self, buffer: Buffer) -> dict:
         dispatch_params = inspect.signature(buffer.dispatch).parameters
         flag_kwargs = {
             "use_fp8": self.use_fp8,
@@ -731,16 +759,21 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return combined_x, event
 
     def _get_buffer(self):
+        # Keep setting the dispatch mode on every call: the NORMAL ->
+        # LOW_LATENCY transition detected there cleans the low-latency buffer.
+        # Only the singleton buffer lookup itself is cached.
         DeepEPBuffer.set_dispatch_mode_as_normal()
 
-        return DeepEPBuffer.get_deepep_buffer(
-            self.group,
-            self.hidden_size,
-            self.params_bytes,
-            self.deepep_mode,
-            self.num_max_dispatch_tokens_per_rank,
-            self.num_experts,
-        )
+        if self._cached_buffer is None:
+            self._cached_buffer = DeepEPBuffer.get_deepep_buffer(
+                self.group,
+                self.hidden_size,
+                self.params_bytes,
+                self.deepep_mode,
+                self.num_max_dispatch_tokens_per_rank,
+                self.num_experts,
+            )
+        return self._cached_buffer
 
 
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
@@ -869,6 +902,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         if not _is_npu:
             return {}
 
+        # Same rationale as the normal-path quant kwargs cache: the pybind
+        # signature is process-stable and the flags only change through
+        # set_deepep_dispatcher_dtype(), which resets this cache.
+        if self._cached_quant_kwargs is None:
+            self._cached_quant_kwargs = self._resolve_npu_mxfp_quantization_kwargs(
+                buffer
+            )
+        return self._cached_quant_kwargs
+
+    def _resolve_npu_mxfp_quantization_kwargs(self, buffer: Buffer) -> dict:
         parameters = inspect.signature(buffer.low_latency_dispatch).parameters
         if any(
             parameter.kind is inspect.Parameter.VAR_KEYWORD
@@ -961,15 +1004,21 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return combined_hidden_states, event, hook
 
     def _get_buffer(self):
+        # Keep setting the dispatch mode on every call: the NORMAL ->
+        # LOW_LATENCY transition detected there cleans the low-latency buffer.
+        # Only the singleton buffer lookup itself is cached.
         DeepEPBuffer.set_dispatch_mode_as_low_latency()
-        return DeepEPBuffer.get_deepep_buffer(
-            self.group,
-            self.hidden_size,
-            self.params_bytes,
-            self.deepep_mode,
-            self.num_max_dispatch_tokens_per_rank,
-            self.num_experts,
-        )
+
+        if self._cached_buffer is None:
+            self._cached_buffer = DeepEPBuffer.get_deepep_buffer(
+                self.group,
+                self.hidden_size,
+                self.params_bytes,
+                self.deepep_mode,
+                self.num_max_dispatch_tokens_per_rank,
+                self.num_experts,
+            )
+        return self._cached_buffer
 
 
 @dataclass
