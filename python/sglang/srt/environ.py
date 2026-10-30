@@ -1187,6 +1187,10 @@ class Envs:
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
     # Set to 0 to allow AscendAttnBackend to set needs_cpu_seq_lens to False for dsa models.
     SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS = EnvBool(True)
+    # Set to 0 to run the post-verify mamba commit inline on the forward
+    # stream instead of deferring it to a side stream that overlaps the
+    # draft window (AscendHybridLinearAttnBackend).
+    SGLANG_NPU_DEFER_MAMBA_COMMIT = EnvBool(True)
 
     # ===================================================================
     # MUSA

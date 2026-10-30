@@ -7,6 +7,7 @@ from sgl_kernel_npu.mamba.mamba_state_update_triton import (
     move_intermediate_cache,
 )
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -230,6 +231,86 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         full_attn_layers: list[int],
     ):
         super().__init__(full_attn_backend, linear_attn_backend, full_attn_layers)
+        # Deferred post-verify mamba commit: run on a side stream to overlap
+        # the draft window; next round's target-side consumers fence behind it
+        # in init_forward_metadata[_out_graph]. Kill switch:
+        # SGLANG_NPU_DEFER_MAMBA_COMMIT=0.
+        self._defer_mamba_commit = envs.SGLANG_NPU_DEFER_MAMBA_COMMIT.get()
+        self._mamba_commit_stream = torch.npu.Stream()
+        self._mamba_commit_pending = False
+        # Persistent per-role buffers holding the commit's int64 index inputs,
+        # written on the caller stream so the commit stream reads no
+        # allocator-managed tensor (see _commit_inputs).
+        self._commit_bufs = {}
+        self._commit_arange_buf = None
+
+    def _fence_deferred_mamba_commit(self):
+        # Order this round's target-side mamba state access behind the
+        # deferred commit. By the time a consumer reaches here the side
+        # stream has long drained, so the wait is free in practice.
+        if self._mamba_commit_pending:
+            torch.npu.current_stream().wait_stream(self._mamba_commit_stream)
+            self._mamba_commit_pending = False
+
+    def _commit_buf(self, key: str, shape, dtype, device) -> torch.Tensor:
+        buf = self._commit_bufs.get(key)
+        if buf is None or buf.shape != torch.Size(shape) or buf.device != device:
+            buf = torch.empty(shape, dtype=dtype, device=device)
+            self._commit_bufs[key] = buf
+        return buf
+
+    def _commit_arange(self, n: int, device: torch.device) -> torch.Tensor:
+        # Slicing a cached buffer replaces the per-round allocate-and-fill.
+        buf = self._commit_arange_buf
+        if buf is None or buf.numel() < n or buf.device != device:
+            buf = torch.arange(max(n, 64), device=device, dtype=torch.int64)
+            self._commit_arange_buf = buf
+        return buf[:n]
+
+    def _commit_inputs(
+        self,
+        state_indices: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+    ):
+        """Build the commit's index inputs as int64 in persistent buffers on
+        the current stream — the copies double as the int64 casts, so the
+        commit stream runs no cast/where kernels. Returns
+        (dst, last, track, steps, track_srcs); the track* tensors are None
+        when there is nothing to track."""
+        n = last_correct_step_indices.shape[0]
+        device = last_correct_step_indices.device
+        dst = self._commit_buf("dst", (n,), torch.int64, device)
+        dst.copy_(state_indices[:n])
+        last = self._commit_buf("last", (n,), torch.int64, device)
+        last.copy_(last_correct_step_indices)
+        # Pre-warm the arange here so it never grows on the commit stream.
+        self._commit_arange(n, device)
+        if mamba_track_indices is None:
+            return dst, last, None, None, None
+        track = self._commit_buf(
+            "track", mamba_track_indices.shape, torch.int64, device
+        )
+        track.copy_(mamba_track_indices)
+        steps = self._commit_buf(
+            "steps", mamba_steps_to_track.shape, torch.int64, device
+        )
+        steps.copy_(mamba_steps_to_track)
+        srcs = torch.where(steps >= 0, dst, track)
+        track_srcs = self._commit_buf("track_srcs", srcs.shape, torch.int64, device)
+        track_srcs.copy_(srcs)
+        return dst, last, track, steps, track_srcs
+
+    def init_forward_metadata(self, forward_batch):
+        self._fence_deferred_mamba_commit()
+        super().init_forward_metadata(forward_batch)
+
+    def init_forward_metadata_out_graph(self, *args, **kwargs):
+        # Graph-decode rounds go through here every round (metadata glue
+        # calls it eagerly), covering the verify-replay consumer.
+        self._fence_deferred_mamba_commit()
+        super().init_forward_metadata_out_graph(*args, **kwargs)
 
     def update_mamba_state_after_mtp_verify(
         self,
@@ -248,73 +329,71 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         - index_select kernel launches
         - nonzero kernel launches
         """
-        del req_pool_indices  # accepted for hook parity; slots come from metadata
-        request_number = last_correct_step_indices.shape[0]
-
-        state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                :request_number
-            ]
+        dst, last, track, steps, track_srcs = self._commit_inputs(
+            self.linear_attn_backend.forward_metadata.mamba_cache_indices,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
         )
+        if not self._defer_mamba_commit:
+            self._run_mamba_commit(dst, last, track, steps, track_srcs)
+            return
+        # Defer the commit onto the side stream so it overlaps the draft
+        # window. Its only consumer is next round's target-side mamba state
+        # access, which fences at the consumer (init_forward_metadata /
+        # init_forward_metadata_out_graph) before touching the state.
+        self._mamba_commit_stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(self._mamba_commit_stream):
+            self._run_mamba_commit(dst, last, track, steps, track_srcs)
+        self._mamba_commit_pending = True
 
+    def _run_mamba_commit(
+        self,
+        dst: torch.Tensor,
+        last: torch.Tensor,
+        track: Optional[torch.Tensor],
+        steps: Optional[torch.Tensor],
+        track_srcs: Optional[torch.Tensor],
+    ):
+        """Move mamba states for the accepted tokens: roll the intermediate
+        ssm/conv states back to the last accepted step per request, keeping
+        tracked rows whose rollback window was already consumed. All index
+        inputs are int64 tensors built by _commit_inputs."""
         mamba_caches = self.linear_attn_backend.state_pool.get_speculative_mamba2_params_all_layers()
 
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
-        dst_indices_tensor = state_indices_tensor.to(torch.int64)  # [N]
-        src_indices_tensor = torch.arange(
-            dst_indices_tensor.shape[0],
-            device=dst_indices_tensor.device,
-            dtype=torch.int64,
-        )
-        last_steps = last_correct_step_indices.to(torch.int64)  # [N]
+        src = self._commit_arange(dst.shape[0], dst.device)
 
-        move_intermediate_cache(
-            ssm_states,
-            intermediate_state_cache,
-            dst_indices_tensor,
-            src_indices_tensor,
-            last_steps,
-        )
+        move_intermediate_cache(ssm_states, intermediate_state_cache, dst, src, last)
 
         draft_token_num = intermediate_state_cache.shape[2]
-        if mamba_track_indices is not None:
-            assert mamba_steps_to_track is not None
-            mamba_track_indices = mamba_track_indices.to(torch.int64)
-            mamba_steps_to_track = mamba_steps_to_track.to(torch.int64)
-
+        if track is not None:
             move_intermediate_cache(
-                ssm_states,
-                intermediate_state_cache,
-                mamba_track_indices,
-                src_indices_tensor,
-                mamba_steps_to_track,
+                ssm_states, intermediate_state_cache, track, src, steps
             )
 
-            track_mask = mamba_steps_to_track >= 0
-            # Track conv state from the verify-time window before rolling back
-            # the working slot; NPU does not keep per-step conv intermediates.
-            src_slots = torch.where(track_mask, dst_indices_tensor, mamba_track_indices)
-            conv_states[:, mamba_track_indices] = conv_states[:, src_slots]
-
-        if dst_indices_tensor.numel() > 0:
-            conv_state_rollback(
-                conv_states,
-                dst_indices_tensor,
-                last_steps,
-                draft_token_num,
+            # Track conv state from the verify-time window before rolling
+            # back the working slot; NPU does not keep per-step conv
+            # intermediates. Gather into a persistent buffer (no MB-level
+            # temporary on the commit stream); scatter via index_put —
+            # aclnnInplaceIndexCopy has no mid-dim fast path and falls back
+            # to a transpose round-trip.
+            gather = self._commit_buf(
+                "track_gather",
+                (conv_states.shape[0], track.shape[0], *conv_states.shape[2:]),
+                conv_states.dtype,
+                conv_states.device,
             )
+            torch.index_select(conv_states, 1, track_srcs, out=gather)
+            conv_states[:, track] = gather
 
-        if mamba_track_indices is not None and mamba_track_indices.numel() > 0:
-            conv_state_rollback(
-                conv_states,
-                mamba_track_indices,
-                mamba_steps_to_track,
-                draft_token_num,
-            )
+        if dst.numel() > 0:
+            conv_state_rollback(conv_states, dst, last, draft_token_num)
 
-        return
+        if track is not None and track.numel() > 0:
+            conv_state_rollback(conv_states, track, steps, draft_token_num)
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
