@@ -214,7 +214,9 @@ class SituAndMul(BaseFusedOp):
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
         from sgl_kernel_npu.activation.situ import situ_and_mul
 
-        return situ_and_mul(x)
+        # Pass the instance params explicitly: the kernel defaults (4.0/25.0)
+        # silently ignore whatever the model config requested.
+        return situ_and_mul(x, beta=self.beta, linear_beta=self.linear_beta)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_native(x)
