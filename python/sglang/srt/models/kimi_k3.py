@@ -160,24 +160,20 @@ from sglang.srt.utils.log_utils import rank0_log
 logger = logging.getLogger(__name__)
 
 # Numerical probe for NPU debugging (garbled-output localization). Enable with
-# SGLANG_LAYER_PROBE=1. Dumps embedding rows + per-layer hidden norms of the
-# first few extend batches, one file per probed TP rank, so they can be
-# compared offline against CPU-loaded weights and across ranks/nodes.
+# SGLANG_LAYER_PROBE=1. Dumps embedding rows, the per-layer residual stream,
+# the per-layer bank-aggregated attention input, the attn-residual bank rows
+# and the final-norm rows of the first few extend batches, one file per probed
+# TP rank, so they can be compared offline against CPU-loaded weights and
+# across ranks/nodes (v4: full-layer capture, bank + attn-input views).
 _LAYER_PROBE_COUNTER: list = []
 _LAYER_PROBE_MAX_BATCHES = 3
 _LAYER_PROBE_RANK_STRIDE = 8
 _LAYER_PROBE_DIR = os.environ.get("SGLANG_LAYER_PROBE_DIR", "/home/z00937177/probe_data")
-# Extra layer indices to capture (comma list, 0-based from start_layer).
 # WARNING: any in-stream device op inserted by a probe (even an async clone)
 # has been observed to crash the first-forward HCCL aicpu allgather on this
 # cluster ("kernel param invalid"). The probe therefore must only hold tensor
 # *views* (pure Python ref, zero device ops); the single D2H happens after the
 # forward's last collective is enqueued.
-_LAYER_PROBE_LAYERS = frozenset(
-    int(x.strip())
-    for x in os.environ.get("SGLANG_LAYER_PROBE_LAYERS", "").split(",")
-    if x.strip().isdigit()
-)
 
 # `experts.<expert_id>.<w1|w2|w3>.` fragment of a checkpoint tensor name, the
 # key FusedMoE.make_expert_params_mapping entries match on.
@@ -3111,10 +3107,18 @@ class KimiK3DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         capture_gathered: Optional[AuxHiddenStateAccumulator] = None,
+        probe_capture: Optional[dict] = None,
     ) -> torch.Tensor:
         hidden_states = self.attn_boundary.prepare(
             hidden_states, forward_batch, capture_gathered=capture_gathered
         )
+        if probe_capture is not None and torch.is_tensor(hidden_states):
+            # View only — zero device ops (see probe init comment). This is
+            # the bank-aggregated + normed attention input of this layer, the
+            # quantity the offline analyzer recomputes from the bank rows.
+            probe_capture[self.layer_idx] = hidden_states[
+                : min(8, hidden_states.shape[0])
+            ]
         hidden_states = self._run_self_attn(
             hidden_states, positions, forward_batch, zero_allocator
         )
@@ -3291,6 +3295,8 @@ class KimiK3LinearModel(nn.Module):
                     "positions": positions,
                     "embed": hidden_states[: min(64, hidden_states.shape[0])],
                     "layers": {},
+                    "attn_inputs": {},
+                    "bank": None,
                 }
         elif self.attn_bank is not None:
             # The bank's wire carries the stream head written: the sending rank
@@ -3320,6 +3326,12 @@ class KimiK3LinearModel(nn.Module):
                 else pp_proxy_tensors["attn_res_bank"]
             )
             self.attn_bank.open(hidden_states, attn_res_block_num, inherited)
+            if probe is not None:
+                # View of the live bank [T, NB, H]: block writes are in-place
+                # (AttnResidual.write copy_), so the end-of-forward D2H sees
+                # every snapshot's final value. Zero device ops.
+                bank_t = self.attn_bank.require().block_residual
+                probe["bank"] = bank_t[: min(8, bank_t.shape[0])]
 
         packs_aux = self.packs_aux_hidden_states
         aux_hidden_states: AuxHiddenStateAccumulator = (
@@ -3354,18 +3366,19 @@ class KimiK3LinearModel(nn.Module):
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
                     zero_allocator=zero_allocator,
+                    probe_capture=(
+                        probe["attn_inputs"] if probe is not None else None
+                    ),
                     capture_gathered=(
                         aux_hidden_states
                         if captures_at_input and i - 1 in captures
                         else None
                     ),
                 )
-            if (
-                probe is not None
-                and torch.is_tensor(hidden_states)
-                and (i - self.start_layer) in _LAYER_PROBE_LAYERS
-            ):
-                # View only — zero device ops (see probe init comment).
+            if probe is not None and torch.is_tensor(hidden_states):
+                # View only — zero device ops (see probe init comment). v4
+                # captures the residual stream of every layer (the offline
+                # analyzer recomputes each layer's bank aggregation from it).
                 probe["layers"][i] = hidden_states[: min(8, hidden_states.shape[0])]
             if (
                 not captures_at_input
@@ -3422,6 +3435,15 @@ class KimiK3LinearModel(nn.Module):
                 "layers": {
                     k: v.detach().cpu().clone() for k, v in probe["layers"].items()
                 },
+                "attn_inputs": {
+                    k: v.detach().cpu().clone()
+                    for k, v in probe["attn_inputs"].items()
+                },
+                "bank": (
+                    probe["bank"].detach().cpu().clone()
+                    if probe["bank"] is not None
+                    else None
+                ),
                 "final_rows": hidden_states[: min(8, hidden_states.shape[0])]
                 .detach()
                 .cpu()
