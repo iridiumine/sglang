@@ -7,6 +7,7 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
+import os
 import re
 from array import array
 from collections.abc import Iterable
@@ -157,6 +158,15 @@ from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
 from sglang.srt.utils.log_utils import rank0_log
 
 logger = logging.getLogger(__name__)
+
+# Numerical probe for NPU debugging (garbled-output localization). Enable with
+# SGLANG_LAYER_PROBE=1. Dumps embedding rows + per-layer hidden norms of the
+# first few extend batches, one file per probed TP rank, so they can be
+# compared offline against CPU-loaded weights and across ranks/nodes.
+_LAYER_PROBE_COUNTER: list = []
+_LAYER_PROBE_MAX_BATCHES = 3
+_LAYER_PROBE_RANK_STRIDE = 8
+_LAYER_PROBE_DIR = os.environ.get("SGLANG_LAYER_PROBE_DIR", "/home/z00937177/probe_data")
 
 # `experts.<expert_id>.<w1|w2|w3>.` fragment of a checkpoint tensor name, the
 # key FusedMoE.make_expert_params_mapping entries match on.
@@ -3238,12 +3248,33 @@ class KimiK3LinearModel(nn.Module):
         input_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        probe = None
         if get_parallel().pp_group.is_first_rank:
             if input_embeds is not None:
                 hidden_states = input_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
             residual_batch.start(forward_batch)
+            if (
+                os.environ.get("SGLANG_LAYER_PROBE", "") == "1"
+                and input_ids is not None
+                and forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+                and get_parallel().tp_rank % _LAYER_PROBE_RANK_STRIDE == 0
+                and len(_LAYER_PROBE_COUNTER) < _LAYER_PROBE_MAX_BATCHES
+            ):
+                probe = {
+                    "tp_rank": get_parallel().tp_rank,
+                    "mode": str(forward_batch.forward_mode),
+                    "input_ids": input_ids[:64].detach().cpu().clone(),
+                    "positions": positions[:64].detach().cpu().clone(),
+                    "embed": hidden_states[: min(64, hidden_states.shape[0])]
+                    .detach()
+                    .cpu()
+                    .clone(),
+                    "norms": [],
+                    "rows": {},
+                }
         elif self.attn_bank is not None:
             # The bank's wire carries the stream head written: the sending rank
             # folds it in before the handoff.
@@ -3312,6 +3343,23 @@ class KimiK3LinearModel(nn.Module):
                         else None
                     ),
                 )
+            if probe is not None and torch.is_tensor(hidden_states):
+                probe["norms"].append(
+                    hidden_states[: min(64, hidden_states.shape[0])]
+                    .detach()
+                    .float()
+                    .pow(2)
+                    .mean()
+                    .sqrt()
+                    .item()
+                )
+                if i - self.start_layer in (0, 1, 2) or (i - self.start_layer) % 8 == 0:
+                    probe["rows"][i] = (
+                        hidden_states[: min(8, hidden_states.shape[0])]
+                        .detach()
+                        .cpu()
+                        .clone()
+                    )
             if (
                 not captures_at_input
                 and i in captures
@@ -3350,6 +3398,37 @@ class KimiK3LinearModel(nn.Module):
         )
         if self.attn_bank is not None:
             self.attn_bank.close()
+
+        if probe is not None and torch.is_tensor(hidden_states):
+            probe["final_norm"] = (
+                hidden_states[: min(64, hidden_states.shape[0])]
+                .detach()
+                .float()
+                .pow(2)
+                .mean()
+                .sqrt()
+                .item()
+            )
+            probe["final_rows"] = (
+                hidden_states[: min(8, hidden_states.shape[0])]
+                .detach()
+                .cpu()
+                .clone()
+            )
+            os.makedirs(_LAYER_PROBE_DIR, exist_ok=True)
+            batch_idx = len(_LAYER_PROBE_COUNTER)
+            path = os.path.join(
+                _LAYER_PROBE_DIR, f"k3_probe_r{probe['tp_rank']}_b{batch_idx}.pt"
+            )
+            torch.save(probe, path)
+            _LAYER_PROBE_COUNTER.append(1)
+            logger.info(
+                f"[LAYER_PROBE] rank={probe['tp_rank']} batch={batch_idx} "
+                f"tokens={probe['input_ids'].shape[0]} mode={probe['mode']} "
+                f"embed_norm={probe['embed'].float().pow(2).mean().sqrt().item():.4f} "
+                f"norms[:4]={[round(n, 4) for n in probe['norms'][:4]]} "
+                f"final_norm={probe['final_norm']:.4f} saved={path}"
+            )
 
         if packs_aux:
             return hidden_states, aux_hidden_states.finalize()
