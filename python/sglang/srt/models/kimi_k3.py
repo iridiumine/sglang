@@ -167,6 +167,17 @@ _LAYER_PROBE_COUNTER: list = []
 _LAYER_PROBE_MAX_BATCHES = 3
 _LAYER_PROBE_RANK_STRIDE = 8
 _LAYER_PROBE_DIR = os.environ.get("SGLANG_LAYER_PROBE_DIR", "/home/z00937177/probe_data")
+# Extra layer indices to capture (comma list, 0-based from start_layer).
+# WARNING: any in-stream device op inserted by a probe (even an async clone)
+# has been observed to crash the first-forward HCCL aicpu allgather on this
+# cluster ("kernel param invalid"). The probe therefore must only hold tensor
+# *views* (pure Python ref, zero device ops); the single D2H happens after the
+# forward's last collective is enqueued.
+_LAYER_PROBE_LAYERS = frozenset(
+    int(x.strip())
+    for x in os.environ.get("SGLANG_LAYER_PROBE_LAYERS", "").split(",")
+    if x.strip().isdigit()
+)
 
 # `experts.<expert_id>.<w1|w2|w3>.` fragment of a checkpoint tensor name, the
 # key FusedMoE.make_expert_params_mapping entries match on.
@@ -3266,19 +3277,16 @@ class KimiK3LinearModel(nn.Module):
                 probe = {
                     "tp_rank": get_parallel().tp_rank,
                     "mode": str(forward_batch.forward_mode),
-                    # NB: keep everything on-device here. Any mid-forward
-                    # host sync (.cpu()/.item()) desynchronizes collective
-                    # enqueue timing across TP ranks and can crash the HCCL
-                    # aicpu allgather on this NPU cluster. The single allowed
-                    # D2H sync happens after the last collective is enqueued
-                    # (see the save block at the end of this forward).
-                    "input_ids": input_ids[:64].detach().clone(),
-                    "positions": positions[:64].detach().clone(),
-                    "embed": hidden_states[: min(64, hidden_states.shape[0])]
-                    .detach()
-                    .clone(),
-                    "norms": [],
-                    "rows": {},
+                    # ZERO-DEVICE-OP probe: hold *views* only. No clone, no
+                    # .cpu(), no .item(), no arithmetic — any of those inserted
+                    # mid-forward crashes the first-forward HCCL aicpu
+                    # allgather on this cluster (kernel param invalid).
+                    # Values are materialized in the save block after the
+                    # forward's last collective has been enqueued.
+                    "input_ids": input_ids,
+                    "positions": positions,
+                    "embed": hidden_states[: min(64, hidden_states.shape[0])],
+                    "layers": {},
                 }
         elif self.attn_bank is not None:
             # The bank's wire carries the stream head written: the sending rank
@@ -3348,20 +3356,13 @@ class KimiK3LinearModel(nn.Module):
                         else None
                     ),
                 )
-            if probe is not None and torch.is_tensor(hidden_states):
-                # On-device only; no .item() here (see probe init comment).
-                probe["norms"].append(
-                    hidden_states[: min(64, hidden_states.shape[0])]
-                    .detach()
-                    .float()
-                    .pow(2)
-                    .mean()
-                    .sqrt()
-                )
-                if i - self.start_layer in (0, 1, 2) or (i - self.start_layer) % 8 == 0:
-                    probe["rows"][i] = hidden_states[
-                        : min(8, hidden_states.shape[0])
-                    ].detach().clone()
+            if (
+                probe is not None
+                and torch.is_tensor(hidden_states)
+                and (i - self.start_layer) in _LAYER_PROBE_LAYERS
+            ):
+                # View only — zero device ops (see probe init comment).
+                probe["layers"][i] = hidden_states[: min(8, hidden_states.shape[0])]
             if (
                 not captures_at_input
                 and i in captures
@@ -3404,39 +3405,31 @@ class KimiK3LinearModel(nn.Module):
         if probe is not None and torch.is_tensor(hidden_states):
             # Single allowed D2H sync point: by now every collective of this
             # forward has been enqueued, so blocking here is harmless.
-            probe["norms"] = (
-                torch.stack(probe["norms"]).cpu().tolist()
-                if probe["norms"]
-                else []
-            )
-            probe["input_ids"] = probe["input_ids"].cpu()
-            probe["positions"] = probe["positions"].cpu()
-            probe["embed"] = probe["embed"].cpu()
-            probe["rows"] = {k: v.cpu() for k, v in probe["rows"].items()}
-            probe["final_norm"] = (
-                hidden_states[: min(64, hidden_states.shape[0])]
+            payload = {
+                "tp_rank": probe["tp_rank"],
+                "mode": probe["mode"],
+                "input_ids": probe["input_ids"][:64].cpu(),
+                "positions": probe["positions"][:64].cpu(),
+                "embed": probe["embed"].detach().cpu().clone(),
+                "layers": {
+                    k: v.detach().cpu().clone() for k, v in probe["layers"].items()
+                },
+                "final_rows": hidden_states[: min(8, hidden_states.shape[0])]
                 .detach()
-                .float()
-                .pow(2)
-                .mean()
-                .sqrt()
                 .cpu()
-                .item()
-            )
-            probe["final_rows"] = hidden_states[: min(8, hidden_states.shape[0])].detach().cpu().clone()
+                .clone(),
+            }
             os.makedirs(_LAYER_PROBE_DIR, exist_ok=True)
             batch_idx = len(_LAYER_PROBE_COUNTER)
             path = os.path.join(
                 _LAYER_PROBE_DIR, f"k3_probe_r{probe['tp_rank']}_b{batch_idx}.pt"
             )
-            torch.save(probe, path)
+            torch.save(payload, path)
             _LAYER_PROBE_COUNTER.append(1)
             logger.info(
                 f"[LAYER_PROBE] rank={probe['tp_rank']} batch={batch_idx} "
-                f"tokens={probe['input_ids'].shape[0]} mode={probe['mode']} "
-                f"embed_norm={probe['embed'].float().pow(2).mean().sqrt().item():.4f} "
-                f"norms[:4]={[round(n, 4) for n in probe['norms'][:4]]} "
-                f"final_norm={probe['final_norm']:.4f} saved={path}"
+                f"tokens={payload['input_ids'].shape[0]} mode={probe['mode']} "
+                f"captured_layers={sorted(probe['layers'])} saved={path}"
             )
 
         if packs_aux:
