@@ -3266,11 +3266,16 @@ class KimiK3LinearModel(nn.Module):
                 probe = {
                     "tp_rank": get_parallel().tp_rank,
                     "mode": str(forward_batch.forward_mode),
-                    "input_ids": input_ids[:64].detach().cpu().clone(),
-                    "positions": positions[:64].detach().cpu().clone(),
+                    # NB: keep everything on-device here. Any mid-forward
+                    # host sync (.cpu()/.item()) desynchronizes collective
+                    # enqueue timing across TP ranks and can crash the HCCL
+                    # aicpu allgather on this NPU cluster. The single allowed
+                    # D2H sync happens after the last collective is enqueued
+                    # (see the save block at the end of this forward).
+                    "input_ids": input_ids[:64].detach().clone(),
+                    "positions": positions[:64].detach().clone(),
                     "embed": hidden_states[: min(64, hidden_states.shape[0])]
                     .detach()
-                    .cpu()
                     .clone(),
                     "norms": [],
                     "rows": {},
@@ -3344,6 +3349,7 @@ class KimiK3LinearModel(nn.Module):
                     ),
                 )
             if probe is not None and torch.is_tensor(hidden_states):
+                # On-device only; no .item() here (see probe init comment).
                 probe["norms"].append(
                     hidden_states[: min(64, hidden_states.shape[0])]
                     .detach()
@@ -3351,15 +3357,11 @@ class KimiK3LinearModel(nn.Module):
                     .pow(2)
                     .mean()
                     .sqrt()
-                    .item()
                 )
                 if i - self.start_layer in (0, 1, 2) or (i - self.start_layer) % 8 == 0:
-                    probe["rows"][i] = (
-                        hidden_states[: min(8, hidden_states.shape[0])]
-                        .detach()
-                        .cpu()
-                        .clone()
-                    )
+                    probe["rows"][i] = hidden_states[
+                        : min(8, hidden_states.shape[0])
+                    ].detach().clone()
             if (
                 not captures_at_input
                 and i in captures
@@ -3400,6 +3402,17 @@ class KimiK3LinearModel(nn.Module):
             self.attn_bank.close()
 
         if probe is not None and torch.is_tensor(hidden_states):
+            # Single allowed D2H sync point: by now every collective of this
+            # forward has been enqueued, so blocking here is harmless.
+            probe["norms"] = (
+                torch.stack(probe["norms"]).cpu().tolist()
+                if probe["norms"]
+                else []
+            )
+            probe["input_ids"] = probe["input_ids"].cpu()
+            probe["positions"] = probe["positions"].cpu()
+            probe["embed"] = probe["embed"].cpu()
+            probe["rows"] = {k: v.cpu() for k, v in probe["rows"].items()}
             probe["final_norm"] = (
                 hidden_states[: min(64, hidden_states.shape[0])]
                 .detach()
@@ -3407,14 +3420,10 @@ class KimiK3LinearModel(nn.Module):
                 .pow(2)
                 .mean()
                 .sqrt()
+                .cpu()
                 .item()
             )
-            probe["final_rows"] = (
-                hidden_states[: min(8, hidden_states.shape[0])]
-                .detach()
-                .cpu()
-                .clone()
-            )
+            probe["final_rows"] = hidden_states[: min(8, hidden_states.shape[0])].detach().cpu().clone()
             os.makedirs(_LAYER_PROBE_DIR, exist_ok=True)
             batch_idx = len(_LAYER_PROBE_COUNTER)
             path = os.path.join(
