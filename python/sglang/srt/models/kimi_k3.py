@@ -3268,7 +3268,7 @@ class KimiK3LinearModel(nn.Module):
             residual_batch.start(forward_batch)
             if (
                 os.environ.get("SGLANG_LAYER_PROBE", "") == "1"
-                and input_ids is not None
+                and forward_batch.input_ids is not None
                 and forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_draft_extend_v2()
                 and get_parallel().tp_rank % _LAYER_PROBE_RANK_STRIDE == 0
@@ -3283,7 +3283,11 @@ class KimiK3LinearModel(nn.Module):
                     # allgather on this cluster (kernel param invalid).
                     # Values are materialized in the save block after the
                     # forward's last collective has been enqueued.
-                    "input_ids": input_ids,
+                    # NOTE: for this model the MM wrapper pre-computes the
+                    # embedding and calls us with input_ids=None +
+                    # input_embeds=..., so read ids from forward_batch and
+                    # probe on both paths (input_embeds / embed_tokens).
+                    "input_ids": forward_batch.input_ids,
                     "positions": positions,
                     "embed": hidden_states[: min(64, hidden_states.shape[0])],
                     "layers": {},
@@ -3409,7 +3413,11 @@ class KimiK3LinearModel(nn.Module):
                 "tp_rank": probe["tp_rank"],
                 "mode": probe["mode"],
                 "input_ids": probe["input_ids"][:64].cpu(),
-                "positions": probe["positions"][:64].cpu(),
+                "positions": (
+                    probe["positions"][:64].cpu()
+                    if probe["positions"] is not None
+                    else None
+                ),
                 "embed": probe["embed"].detach().cpu().clone(),
                 "layers": {
                     k: v.detach().cpu().clone() for k, v in probe["layers"].items()
