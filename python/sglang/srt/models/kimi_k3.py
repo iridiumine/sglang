@@ -3389,6 +3389,10 @@ class KimiK3LinearModel(nn.Module):
                     self._dspark_capture_stream(i, hidden_states, forward_batch)
                 )
 
+        # PP non-last ranks rebind hidden_states to PPProxyTensors below; keep
+        # the tensor for the probe's save block (final_rows is the first
+        # stage's output under PP, not the model's final hidden).
+        probe_final = hidden_states if probe is not None else None
         if not self.pp_group.is_last_rank:
             if self.attn_bank is not None:
                 # The wire carries the stream head beside the bank.
@@ -3419,9 +3423,12 @@ class KimiK3LinearModel(nn.Module):
         if self.attn_bank is not None:
             self.attn_bank.close()
 
-        if probe is not None and torch.is_tensor(hidden_states):
+        if probe is not None and probe_final is not None:
             # Single allowed D2H sync point: by now every collective of this
             # forward has been enqueued, so blocking here is harmless.
+            # NOTE: under PP the first (probe) rank rebinds hidden_states to
+            # PPProxyTensors above, so we save `probe_final` — the tensor
+            # captured before the rebind.
             payload = {
                 "tp_rank": probe["tp_rank"],
                 "mode": probe["mode"],
@@ -3444,7 +3451,7 @@ class KimiK3LinearModel(nn.Module):
                     if probe["bank"] is not None
                     else None
                 ),
-                "final_rows": hidden_states[: min(8, hidden_states.shape[0])]
+                "final_rows": probe_final[: min(8, probe_final.shape[0])]
                 .detach()
                 .cpu()
                 .clone(),
