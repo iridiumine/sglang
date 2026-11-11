@@ -167,6 +167,10 @@ logger = logging.getLogger(__name__)
 # across ranks/nodes (v4: full-layer capture, bank + attn-input views).
 _LAYER_PROBE_COUNTER: list = []
 _LAYER_PROBE_MAX_BATCHES = 3
+_LAYER_PROBE_DECODE_COUNTER: list = []
+_LAYER_PROBE_MAX_DECODE_STEPS = int(
+    os.environ.get("SGLANG_LAYER_PROBE_DECODE_STEPS", "32")
+)
 _LAYER_PROBE_RANK_STRIDE = 8
 _LAYER_PROBE_DIR = os.environ.get("SGLANG_LAYER_PROBE_DIR", "/home/z00937177/probe_data")
 # WARNING: any in-stream device op inserted by a probe (even an async clone)
@@ -182,8 +186,10 @@ def _layer_probe_dump(probe: dict, final_rows) -> None:
     Called on the PP non-last rank right before it rebinds to PPProxyTensors,
     and on the last rank after final_norm."""
     payload = {
+        "pp_rank": probe["pp_rank"],
         "tp_rank": probe["tp_rank"],
         "mode": probe["mode"],
+        "kind": probe["kind"],
         "input_ids": probe["input_ids"][:64].cpu(),
         "positions": (
             probe["positions"][:64].cpu()
@@ -206,14 +212,24 @@ def _layer_probe_dump(probe: dict, final_rows) -> None:
         "final_rows": final_rows.detach().cpu().clone(),
     }
     os.makedirs(_LAYER_PROBE_DIR, exist_ok=True)
-    batch_idx = len(_LAYER_PROBE_COUNTER)
+    if probe["kind"] == "decode":
+        idx = len(_LAYER_PROBE_DECODE_COUNTER)
+        suffix = f"d{idx}"
+    else:
+        idx = len(_LAYER_PROBE_COUNTER)
+        suffix = f"b{idx}"
     path = os.path.join(
-        _LAYER_PROBE_DIR, f"k3_probe_r{probe['tp_rank']}_b{batch_idx}.pt"
+        _LAYER_PROBE_DIR,
+        f"k3_probe_p{probe['pp_rank']}_r{probe['tp_rank']}_{suffix}.pt",
     )
     torch.save(payload, path)
-    _LAYER_PROBE_COUNTER.append(1)
+    if probe["kind"] == "decode":
+        _LAYER_PROBE_DECODE_COUNTER.append(1)
+    else:
+        _LAYER_PROBE_COUNTER.append(1)
     logger.info(
-        f"[LAYER_PROBE] rank={probe['tp_rank']} batch={batch_idx} "
+        f"[LAYER_PROBE] pp={probe['pp_rank']} rank={probe['tp_rank']} "
+        f"{probe['kind']}={idx} "
         f"tokens={payload['input_ids'].shape[0]} mode={probe['mode']} "
         f"captured_layers={sorted(probe['layers'])} saved={path}"
     )
@@ -3313,34 +3329,6 @@ class KimiK3LinearModel(nn.Module):
             else:
                 hidden_states = self.embed_tokens(input_ids)
             residual_batch.start(forward_batch)
-            if (
-                os.environ.get("SGLANG_LAYER_PROBE", "") == "1"
-                and forward_batch.input_ids is not None
-                and forward_batch.forward_mode.is_extend()
-                and not forward_batch.forward_mode.is_draft_extend_v2()
-                and get_parallel().tp_rank % _LAYER_PROBE_RANK_STRIDE == 0
-                and len(_LAYER_PROBE_COUNTER) < _LAYER_PROBE_MAX_BATCHES
-            ):
-                probe = {
-                    "tp_rank": get_parallel().tp_rank,
-                    "mode": str(forward_batch.forward_mode),
-                    # ZERO-DEVICE-OP probe: hold *views* only. No clone, no
-                    # .cpu(), no .item(), no arithmetic — any of those inserted
-                    # mid-forward crashes the first-forward HCCL aicpu
-                    # allgather on this cluster (kernel param invalid).
-                    # Values are materialized in the save block after the
-                    # forward's last collective has been enqueued.
-                    # NOTE: for this model the MM wrapper pre-computes the
-                    # embedding and calls us with input_ids=None +
-                    # input_embeds=..., so read ids from forward_batch and
-                    # probe on both paths (input_embeds / embed_tokens).
-                    "input_ids": forward_batch.input_ids,
-                    "positions": positions,
-                    "embed": hidden_states[: min(64, hidden_states.shape[0])],
-                    "layers": {},
-                    "attn_inputs": {},
-                    "bank": None,
-                }
         elif self.attn_bank is not None:
             # The bank's wire carries the stream head written: the sending rank
             # folds it in before the handoff.
@@ -3351,6 +3339,49 @@ class KimiK3LinearModel(nn.Module):
             hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
+
+        # v5: every PP stage probes its own layer range (embed = embedding on
+        # the first rank, the stage-entry stream head on later ranks).
+        # v6: decode batches are probed too (independent step counter) so the
+        # decode trajectory can be diffed against a healthy reference.
+        _fm = forward_batch.forward_mode
+        _probe_kind = None
+        if os.environ.get("SGLANG_LAYER_PROBE", "") == "1" and (
+            get_parallel().tp_rank % _LAYER_PROBE_RANK_STRIDE == 0
+        ):
+            if (
+                _fm.is_extend()
+                and not _fm.is_draft_extend_v2()
+                and len(_LAYER_PROBE_COUNTER) < _LAYER_PROBE_MAX_BATCHES
+            ):
+                _probe_kind = "extend"
+            elif (
+                _fm.is_decode()
+                and len(_LAYER_PROBE_DECODE_COUNTER) < _LAYER_PROBE_MAX_DECODE_STEPS
+            ):
+                _probe_kind = "decode"
+        if (
+            _probe_kind is not None
+            and forward_batch.input_ids is not None
+        ):
+            probe = {
+                "pp_rank": get_parallel().pp_rank,
+                "tp_rank": get_parallel().tp_rank,
+                "mode": str(forward_batch.forward_mode),
+                "kind": _probe_kind,
+                # ZERO-DEVICE-OP probe: hold *views* only. No clone, no
+                # .cpu(), no .item(), no arithmetic — any of those inserted
+                # mid-forward crashes the first-forward HCCL aicpu
+                # allgather on this cluster (kernel param invalid).
+                # Values are materialized in the save block after the
+                # forward's last collective has been enqueued.
+                "input_ids": forward_batch.input_ids,
+                "positions": positions,
+                "embed": hidden_states[: min(64, hidden_states.shape[0])],
+                "layers": {},
+                "attn_inputs": {},
+                "bank": None,
+            }
 
         total_num_layers = self.end_layer - self.start_layer
         device = hidden_states.device
