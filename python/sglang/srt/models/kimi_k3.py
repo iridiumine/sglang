@@ -175,6 +175,49 @@ _LAYER_PROBE_DIR = os.environ.get("SGLANG_LAYER_PROBE_DIR", "/home/z00937177/pro
 # *views* (pure Python ref, zero device ops); the single D2H happens after the
 # forward's last collective is enqueued.
 
+
+def _layer_probe_dump(probe: dict, final_rows) -> None:
+    """Materialize and save one probe. The single D2H sync point: by now every
+    collective of this forward has been enqueued, so blocking is harmless.
+    Called on the PP non-last rank right before it rebinds to PPProxyTensors,
+    and on the last rank after final_norm."""
+    payload = {
+        "tp_rank": probe["tp_rank"],
+        "mode": probe["mode"],
+        "input_ids": probe["input_ids"][:64].cpu(),
+        "positions": (
+            probe["positions"][:64].cpu()
+            if probe["positions"] is not None
+            else None
+        ),
+        "embed": probe["embed"].detach().cpu().clone(),
+        "layers": {
+            k: v.detach().cpu().clone() for k, v in probe["layers"].items()
+        },
+        "attn_inputs": {
+            k: v.detach().cpu().clone()
+            for k, v in probe["attn_inputs"].items()
+        },
+        "bank": (
+            probe["bank"].detach().cpu().clone()
+            if probe["bank"] is not None
+            else None
+        ),
+        "final_rows": final_rows.detach().cpu().clone(),
+    }
+    os.makedirs(_LAYER_PROBE_DIR, exist_ok=True)
+    batch_idx = len(_LAYER_PROBE_COUNTER)
+    path = os.path.join(
+        _LAYER_PROBE_DIR, f"k3_probe_r{probe['tp_rank']}_b{batch_idx}.pt"
+    )
+    torch.save(payload, path)
+    _LAYER_PROBE_COUNTER.append(1)
+    logger.info(
+        f"[LAYER_PROBE] rank={probe['tp_rank']} batch={batch_idx} "
+        f"tokens={payload['input_ids'].shape[0]} mode={probe['mode']} "
+        f"captured_layers={sorted(probe['layers'])} saved={path}"
+    )
+
 # `experts.<expert_id>.<w1|w2|w3>.` fragment of a checkpoint tensor name, the
 # key FusedMoE.make_expert_params_mapping entries match on.
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
@@ -3389,10 +3432,11 @@ class KimiK3LinearModel(nn.Module):
                     self._dspark_capture_stream(i, hidden_states, forward_batch)
                 )
 
-        # PP non-last ranks rebind hidden_states to PPProxyTensors below; keep
-        # the tensor for the probe's save block (final_rows is the first
-        # stage's output under PP, not the model's final hidden).
-        probe_final = hidden_states if probe is not None else None
+        # PP non-last ranks rebind hidden_states to PPProxyTensors and return
+        # early below; dump the probe first (its views are all captured by
+        # now, and this rank's collectives are all enqueued).
+        if probe is not None:
+            _layer_probe_dump(probe, hidden_states)
         if not self.pp_group.is_last_rank:
             if self.attn_bank is not None:
                 # The wire carries the stream head beside the bank.
@@ -3423,51 +3467,10 @@ class KimiK3LinearModel(nn.Module):
         if self.attn_bank is not None:
             self.attn_bank.close()
 
-        if probe is not None and probe_final is not None:
-            # Single allowed D2H sync point: by now every collective of this
-            # forward has been enqueued, so blocking here is harmless.
-            # NOTE: under PP the first (probe) rank rebinds hidden_states to
-            # PPProxyTensors above, so we save `probe_final` — the tensor
-            # captured before the rebind.
-            payload = {
-                "tp_rank": probe["tp_rank"],
-                "mode": probe["mode"],
-                "input_ids": probe["input_ids"][:64].cpu(),
-                "positions": (
-                    probe["positions"][:64].cpu()
-                    if probe["positions"] is not None
-                    else None
-                ),
-                "embed": probe["embed"].detach().cpu().clone(),
-                "layers": {
-                    k: v.detach().cpu().clone() for k, v in probe["layers"].items()
-                },
-                "attn_inputs": {
-                    k: v.detach().cpu().clone()
-                    for k, v in probe["attn_inputs"].items()
-                },
-                "bank": (
-                    probe["bank"].detach().cpu().clone()
-                    if probe["bank"] is not None
-                    else None
-                ),
-                "final_rows": probe_final[: min(8, probe_final.shape[0])]
-                .detach()
-                .cpu()
-                .clone(),
-            }
-            os.makedirs(_LAYER_PROBE_DIR, exist_ok=True)
-            batch_idx = len(_LAYER_PROBE_COUNTER)
-            path = os.path.join(
-                _LAYER_PROBE_DIR, f"k3_probe_r{probe['tp_rank']}_b{batch_idx}.pt"
-            )
-            torch.save(payload, path)
-            _LAYER_PROBE_COUNTER.append(1)
-            logger.info(
-                f"[LAYER_PROBE] rank={probe['tp_rank']} batch={batch_idx} "
-                f"tokens={payload['input_ids'].shape[0]} mode={probe['mode']} "
-                f"captured_layers={sorted(probe['layers'])} saved={path}"
-            )
+        if probe is not None:
+            # Single allowed D2H sync point (see _layer_probe_dump): the last
+            # rank's final_norm output rows.
+            _layer_probe_dump(probe, hidden_states[: min(8, hidden_states.shape[0])])
 
         if packs_aux:
             return hidden_states, aux_hidden_states.finalize()
