@@ -790,6 +790,32 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         parallel = get_parallel()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
+        # The pool branch up in the configurator keys off the process-wide
+        # backend (the target's); a draft resolves its own backend. A triton
+        # draft (DFLASH on NPU) exchanges KV in the GPU MLATokenToKVPool
+        # layout, so this pool must expose the combined-row views instead
+        # of the FIA split. Target pools and ascend drafts keep the split.
+        triton_mla_views = False
+        if is_draft_worker:
+            from sglang.srt.speculative.draft_worker_common import (
+                resolve_draft_worker_attention_backend,
+            )
+
+            triton_mla_views = resolve_draft_worker_attention_backend() == "triton"
+        self.triton_mla_views = triton_mla_views
+        if triton_mla_views:
+            # A triton draft attention exchanges KV in the GPU MLATokenToKVPool
+            # layout: get_key_buffer returns one whole [nope|rope] row per slot
+            # and get_value_buffer its latent slice. Only the single combined
+            # allocation can express that; the default NPU FIA split (separate
+            # latent / rope buffers) cannot.
+            assert not self.dsa_kv_cache_store_fp8, (
+                "triton_mla_views is incompatible with the DSA fp8 KV layout"
+            )
+            assert modelslim_cache_layout is None, (
+                "triton_mla_views is incompatible with the modelslim KV layout"
+            )
+            use_combined_kv_buffer = True
         self.use_combined_kv_buffer = use_combined_kv_buffer
         global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
         kv_page_padding = global_page_padding if is_draft_worker else 1
@@ -967,6 +993,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
 
     def get_kv_buffer(self, layer_id: int):
+        if self.triton_mla_views:
+            # GPU MLATokenToKVPool semantics: (whole row, latent slice).
+            return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
@@ -1002,6 +1031,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
 
+        if self.triton_mla_views:
+            # GPU MLATokenToKVPool semantics: the whole [nope|rope] row, as a
+            # zero-copy [slots, 1, dim] flatten of the NPU 4D page blocks.
+            buffer = self.kv_buffer[layer_id - self.start_layer].flatten(0, 1)
+            if self.store_dtype != self.dtype:
+                return buffer.view(self.dtype)
+            return buffer
         if self.store_dtype != self.dtype:
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.k_buffer[layer_id - self.start_layer]
@@ -1011,6 +1047,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
 
+        if self.triton_mla_views:
+            # The latent (NoPE) slice of the same rows, not the separate NPU
+            # rope buffer: triton MLA reads V as the latent half of the row.
+            buffer = self.k_buffer[layer_id - self.start_layer].flatten(0, 1)
+            if self.store_dtype != self.dtype:
+                return buffer.view(self.dtype)
+            return buffer
         if self.store_dtype != self.dtype:
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.v_buffer[layer_id - self.start_layer]
@@ -1121,6 +1164,22 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._raise_if_native_kv_cache_disabled()
         layer_id = layer.layer_id
+        if self.triton_mla_views:
+            # Triton hands over whole [nope|rope] rows; cache_v is the latent
+            # slice of the same row, not a separate rope part, so the row is
+            # stored as one unit (GPU MLATokenToKVPool semantics).
+            if cache_k.dtype != self.dtype:
+                cache_k = cache_k.to(self.dtype)
+            if self.store_dtype != self.dtype:
+                cache_k = cache_k.view(self.store_dtype)
+            torch_npu.npu_scatter_nd_update_(
+                self.kv_buffer[layer_id - self.start_layer].view(
+                    -1, 1, self.kv_cache_dim + self.kr_cache_dim
+                ),
+                loc.view(-1, 1),
+                cache_k.reshape(-1, 1, self.kv_cache_dim + self.kr_cache_dim),
+            )
+            return
         if self.dsa_kv_cache_store_fp8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
@@ -1179,6 +1238,53 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ),
             loc.view(-1, 1),
             cache_v.view(-1, 1, self.qk_rope_head_dim),
+        )
+
+    def set_mla_kv_buffer(
+        self,
+        layer,
+        loc_info,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
+    ):
+        if not self.triton_mla_views:
+            # Only a triton draft takes this door today (DFLASH context-KV
+            # materialization); defer to the inherited GPU path otherwise.
+            super().set_mla_kv_buffer(
+                layer,
+                loc_info,
+                cache_k_nope,
+                cache_k_rope,
+                layer_id_override=layer_id_override,
+            )
+            return
+        loc, _, _ = unwrap_write_loc(loc_info)
+        self._raise_if_native_kv_cache_disabled()
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        if cache_k_nope.dtype != self.dtype:
+            cache_k_nope = cache_k_nope.to(self.dtype)
+        if (
+            cache_k_rope is not None
+            and cache_k_rope.numel() > 0
+            and cache_k_rope.dtype != self.dtype
+        ):
+            cache_k_rope = cache_k_rope.to(self.dtype)
+        row = (
+            torch.cat((cache_k_nope, cache_k_rope), dim=-1)
+            if self.kr_cache_dim > 0
+            else cache_k_nope
+        )
+        if self.store_dtype != self.dtype:
+            row = row.view(self.store_dtype)
+        torch_npu.npu_scatter_nd_update_(
+            self.kv_buffer[layer_id - self.start_layer].view(
+                -1, 1, self.kv_cache_dim + self.kr_cache_dim
+            ),
+            loc.view(-1, 1),
+            row.reshape(-1, 1, self.kv_cache_dim + self.kr_cache_dim),
         )
 
     def _set_fia_nz_kv_buffer(

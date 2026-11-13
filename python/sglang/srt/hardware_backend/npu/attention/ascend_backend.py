@@ -1976,6 +1976,19 @@ class AscendAttnBackend(AttentionBackend):
             and not forward_batch.forward_mode.is_target_verify()
         )
 
+        # attn-DP idle ranks run the target-verify keep-alive forward on pure
+        # padding rows: prepare_mlp_sync_batch relabels IDLE as TARGET_VERIFY
+        # and pads seq_lens with this backend's fill value (0), leaving the
+        # block table with zero pages, which aclnnSparseFlashAttention
+        # rejects with a tiling error (561002). The padded out_cache_loc is
+        # zeros as well, so skip the KV write below to avoid corrupting pool
+        # slot 0. Every padding row is discarded by the DP gather downstream.
+        if (
+            forward_batch._original_forward_mode is not None
+            and forward_batch._original_forward_mode.is_idle()
+        ):
+            return q.new_zeros(q.shape)
+
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
             k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)

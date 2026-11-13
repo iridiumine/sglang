@@ -29,11 +29,17 @@ from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
 from sglang.kernels.ops.attention.dflash_block_splitkv import dflash_block_splitkv
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported, is_hip
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    is_gfx1250_supported,
+    is_hip,
+    is_npu,
+)
 
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +84,21 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware
-    if _is_hip:
+    if _is_npu:
+        # Ascend NPU lowers tl tiles into the 256KB unified buffer (~192KB
+        # usable after reserve). At MLA dims (Lq=576/Lv=512) the default
+        # (32, 32) tile needs ~248KB ("ub overflow, requires 1982464 bits
+        # while 1572864 bits available" from the BiShengHIR pipeline), so
+        # halve both axes: the fp32 acc alone is BLOCK_M*BLOCK_DV*4 bytes
+        # and triton-ascend multi-buffers the streamed K/V tiles.
+        if Lq >= 576:
+            BLOCK_M, BLOCK_N = (16, 16)
+        elif Lq <= 128:
+            BLOCK_M, BLOCK_N = (64, 64)
+        else:
+            BLOCK_M, BLOCK_N = (32, 32)
+        num_warps = 4
+    elif _is_hip:
         if _is_gfx95 and _is_triton_ge_37 and Lq == 576 and Lv == 512:
             # Triton 3.7's N64 codegen reaches 512 VGPRs and spills 472 bytes
             # of scratch on gfx950. N32 keeps BLOCK_M/launch work unchanged,
