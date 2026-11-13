@@ -171,6 +171,13 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
 def _get_num_stages_for_extend_attention(
     Lq: int, Lv: int, block_n: int | None = None
 ) -> int:
+    if _is_npu and Lq >= 576 and Lv >= 512:
+        # The (16, 16) MLA tile leaves ~70KB of the ~192KB Ascend UB budget;
+        # double-buffer the streamed K/V tiles so the next tile's loads overlap
+        # the current tile's softmax/dot chain. Without pipelining every tile
+        # iteration pays the full AIV<->AIC sync round trip serialized with the
+        # memory latency, which dominates the whole draft-extend step.
+        return 2
     if _is_gfx95 and Lq == 192 and Lv == 128:
         return 2
     if (
@@ -566,7 +573,23 @@ def _fwd_kernel(
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     prefix_end = 0 if SKIP_PREFIX else cur_seq_len_prefix
-    for start_n in range(0, prefix_end, BLOCK_N_PREFIX):
+    # Sliding window: the window mask below (q_id <= kv_id + W) leaves no
+    # unmasked element in a prefix tile below the first query row's window
+    # floor, so bound the sweep the same way the extend stage below does.
+    # When the caller already hands a window-clipped rail (cur_seq_len_prefix
+    # <= W) this is a no-op; when the prefix spans beyond the window it drops
+    # the fully-masked tiles instead of paying SKIP_TILE's per-tile reduction
+    # for them -- critical on latency-bound targets (NPU mix-mode) where each
+    # skipped tile still costs a full scalar/sync round trip.
+    prefix_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        prefix_start = (
+            tl.maximum(
+                cur_seq_len_prefix + cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0
+            )
+            // BLOCK_N_PREFIX
+        ) * BLOCK_N_PREFIX
+    for start_n in range(prefix_start, prefix_end, BLOCK_N_PREFIX):
         start_n = tl.multiple_of(start_n, BLOCK_N_PREFIX)
         mask_n = (start_n + offs_n_prefix) < cur_seq_len_prefix
 
@@ -1163,7 +1186,9 @@ def extend_attention_fwd(
     else:
         grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_stages = (
-        _get_num_stages_for_extend_attention(Lq, Lv, BLOCK_N) if kimi_k3_shape else 1
+        _get_num_stages_for_extend_attention(Lq, Lv, BLOCK_N)
+        if kimi_k3_shape or _is_npu
+        else 1
     )
 
     extra_kargs = {}
