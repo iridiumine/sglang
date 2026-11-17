@@ -14,6 +14,9 @@ from sgl_kernel_npu.operators import attention as npu_attention_ops
 from sgl_kernel_npu.operators import indexer as npu_indexer_ops
 from sgl_kernel_npu.operators import mem_cache as npu_cache_ops
 
+from sglang.kernels.ops.speculative.dspark.dspark_verify_positions import (
+    fill_verify_positions_cmp_padding_one_fused as _fill_verify_positions_cmp_padding_one_fused,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
@@ -1016,11 +1019,6 @@ class DeepseekV4AscendAttnBackend(
             model_runner.spec_algorithm is not None
             and model_runner.spec_algorithm.is_dspark()
         )
-        self._is_eagle_algorithm = bool(
-            model_runner.spec_algorithm is not None
-            and model_runner.spec_algorithm.is_eagle()
-            and not model_runner.spec_algorithm.is_frozen_kv_mtp()
-        )
         self._is_dspark_draft_worker = bool(
             getattr(model_runner, "is_draft_worker", False)
             and self._is_dspark_algorithm
@@ -1573,6 +1571,10 @@ class DeepseekV4AscendAttnBackend(
             )
 
         live_seq_lens = live_seq_lens[:request_num]
+        if _fill_verify_positions_cmp_padding_one_fused(
+            positions, live_seq_lens, dst, ratio, n_draft
+        ):
+            return
         token_offsets = torch.arange(
             1,
             n_draft + 1,
@@ -1587,6 +1589,18 @@ class DeepseekV4AscendAttnBackend(
         # request-major positions array, then move RoPE to the group's first token.
         values = positions[: request_num * n_draft].reshape(-1) + (1 - ratio)
         self._stable_compact_1d(dst, values, boundary_mask.reshape(-1))
+
+    def _h2d_pinned_async(
+        self, cpu_tensor: torch.Tensor, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Async H2D via pinned staging: .to(device) from pageable memory
+        blocks until the whole queue drains on NPU. Device-side inputs only
+        need the dtype cast (mirrorless replay ctx *_cpu fields may hold
+        device tensors)."""
+        if cpu_tensor.device.type != "cpu":
+            return cpu_tensor.to(dtype=dtype)
+        pin = torch.empty_like(cpu_tensor, dtype=dtype, pin_memory=True)
+        return pin.copy_(cpu_tensor).to(self.device, non_blocking=True)
 
     def _build_dsv4_graph_replay_ctx(self, forward_batch: ForwardBatch):
         graph_mode = forward_batch.forward_mode
@@ -1639,7 +1653,7 @@ class DeepseekV4AscendAttnBackend(
             else:
                 live_seq_lens_cpu = raw_seq_lens
                 final_seq_lens_cpu = live_seq_lens_cpu
-            live_seq_lens = live_seq_lens_cpu.to(device=device, dtype=torch.int32)
+            live_seq_lens = self._h2d_pinned_async(live_seq_lens_cpu, torch.int32)
         else:
             raw_seq_lens_cpu = seq_lens_cpu[:bs]
             if graph_mode.is_target_verify():
@@ -1729,7 +1743,7 @@ class DeepseekV4AscendAttnBackend(
         else:
             compress_seq_lens_max = int(final_seq_lens_cpu.max()) if bs > 0 else 0
         if active_target_verify:
-            compress_seq_lens = final_seq_lens_cpu.to(device=device, dtype=torch.int32)
+            compress_seq_lens = self._h2d_pinned_async(final_seq_lens_cpu, torch.int32)
 
         return SimpleNamespace(
             forward_batch=forward_batch,
@@ -1766,8 +1780,13 @@ class DeepseekV4AscendAttnBackend(
         attn_seq_lens = ctx.live_seq_lens
         if ctx.graph_mode.is_target_verify():
             valid_verify_rows = ctx.live_seq_lens > 0
-            final_seq_lens = ctx.final_seq_lens_cpu.to(
-                device=ctx.device, dtype=torch.int32
+            # ctx.compress_seq_lens already holds the uploaded final_seq_lens
+            # on the active verify path; only idle / no-compress replays
+            # need to upload it here.
+            final_seq_lens = (
+                ctx.compress_seq_lens
+                if ctx.active_target_verify
+                else self._h2d_pinned_async(ctx.final_seq_lens_cpu, torch.int32)
             )
             attn_seq_lens = torch.where(
                 valid_verify_rows, final_seq_lens, ctx.live_seq_lens
@@ -1847,40 +1866,25 @@ class DeepseekV4AscendAttnBackend(
                 final_seq_lens_cpu=verify_seq_lens_cpu,
                 verify_lens_cpu=ctx.effective_verify_lens_cpu,
             )
-        elif self._is_eagle_algorithm or ctx.mirrorless:
-            self._fill_verify_positions_cmp_padding_one_device(
-                ctx.forward_batch.positions,
-                fm.positions_cmp_padding_c4,
-                4,
-                ctx.live_seq_lens,
-                n_draft=ctx.tokens_per_bs,
-            )
-            self._fill_verify_positions_cmp_padding_one_device(
-                ctx.forward_batch.positions,
-                fm.positions_cmp_padding_c128,
-                128,
-                ctx.live_seq_lens,
-                n_draft=ctx.tokens_per_bs,
-            )
         else:
-            verify_seq_lens_cpu = ctx.final_seq_lens_cpu
-            verify_seq_lens_cpu = torch.where(
-                ctx.live_seq_lens_cpu > 0,
-                verify_seq_lens_cpu,
-                ctx.live_seq_lens_cpu,
-            )
-            self._fill_verify_positions_cmp_padding_one(
+            # Uniform verify rows for every non-ragged algorithm (EAGLE,
+            # DSpark/DFLASH non-compact, ...): the caller expands final lengths
+            # as live + n_draft, so the device variant derives the identical
+            # boundary set from the live prefix lengths alone. This replaces
+            # the host arithmetic chain (arange/mask/nonzero) and the per-ratio
+            # pinned index upload of the CPU reference with on-device compute.
+            self._fill_verify_positions_cmp_padding_one_device(
                 ctx.forward_batch.positions,
                 fm.positions_cmp_padding_c4,
                 4,
-                verify_seq_lens_cpu,
+                ctx.live_seq_lens,
                 n_draft=ctx.tokens_per_bs,
             )
-            self._fill_verify_positions_cmp_padding_one(
+            self._fill_verify_positions_cmp_padding_one_device(
                 ctx.forward_batch.positions,
                 fm.positions_cmp_padding_c128,
                 128,
-                verify_seq_lens_cpu,
+                ctx.live_seq_lens,
                 n_draft=ctx.tokens_per_bs,
             )
         valid = ctx.live_seq_lens[: ctx.bs] > 0
@@ -2665,7 +2669,7 @@ class DeepseekV4AscendAttnBackend(
 
         if not indices:
             return
-        gather = torch.cat(indices)[: dst.numel()].to(device=positions.device)
+        gather = self._h2d_pinned_async(torch.cat(indices)[: dst.numel()], torch.int64)
         dst[: gather.numel()].copy_(torch.gather(positions, 0, gather))
 
     def _fill_verify_positions_cmp_padding_one(
@@ -2697,10 +2701,7 @@ class DeepseekV4AscendAttnBackend(
 
         if indices.numel() == 0:
             return
-        # This tiny H2D copy runs on the verify metadata path. Keep it blocking:
-        # on NPU, a non-blocking copy from a short-lived pinned CPU tensor can
-        # surface later as an unrelated CopyKernel stream failure.
-        indices = indices[: dst.numel()].to(device=positions.device)
+        indices = self._h2d_pinned_async(indices[: dst.numel()], torch.int64)
         # ``indices`` selects the final token of each newly completed group.
         # The compressed KV applies RoPE at the group's first token, matching
         # the decode path and ``comp_pos = (position // ratio) * ratio``.
