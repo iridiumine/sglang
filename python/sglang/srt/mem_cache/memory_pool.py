@@ -1204,12 +1204,21 @@ class MambaPool:
             from sglang.srt.mem_cache.mamba_slot_fused import fused_clear_conv_slots
 
             fused_clear_conv_slots(self._conv_slot_desc, idx64)
+        elif _is_npu:
+            # NPU: aclnnIndexFill streams the whole state buffer even when the
+            # index set is a single slot (measured ~19ms for one slot on the
+            # ssm pool), so zero the selected rows directly instead.
+            for conv in self.mamba_cache.conv:
+                conv[:, idx64] = 0
         else:
             for conv in self.mamba_cache.conv:
                 conv.index_fill_(1, idx64, 0)
         temporal = self.mamba_cache.temporal
         if temporal.numel() > 0:
-            temporal.index_fill_(1, idx64, 0)
+            if _is_npu:
+                temporal[:, idx64] = 0
+            else:
+                temporal.index_fill_(1, idx64, 0)
 
     def _copy_temporal_slots(
         self, *, src_indices: torch.Tensor, dst_indices: torch.Tensor

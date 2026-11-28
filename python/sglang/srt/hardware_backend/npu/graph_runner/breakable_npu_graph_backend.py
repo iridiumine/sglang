@@ -30,7 +30,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend, get_moe_ascend_ops_config
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
-from sglang.srt.runtime_context import get_flags, get_forward
+from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -82,10 +82,17 @@ class BreakableNPUGraphBackend(BreakableCudaGraphBackend):
     ) -> None:
         # Every TP rank runs the capture bucket at the same width; publish that
         # layout so ascend_ops skips the live row-count exchange, a host sync
-        # the captured graph cannot contain.
-        with get_forward().scoped(
-            ascend_allgather_row_sizes=[shape_key.size] * self._tp_group.world_size
-        ):
+        # the captured graph cannot contain.  In tp-only prefill the FFN entry
+        # slices the token axis across attn-TP (sequence-parallel layout), so
+        # each rank dispatches size/attn_tp rows, not the full bucket width.
+        parallel = get_parallel()
+        if parallel.attn_dp_size == 1 and parallel.attn_tp_size > 1:
+            attn_tp = parallel.attn_tp_size
+            base, extra = divmod(shape_key.size, attn_tp)
+            row_sizes = [base + (rank < extra) for rank in range(attn_tp)]
+        else:
+            row_sizes = [shape_key.size] * self._tp_group.world_size
+        with get_forward().scoped(ascend_allgather_row_sizes=row_sizes):
             super().capture_one(
                 shape_key,
                 forward_fn,

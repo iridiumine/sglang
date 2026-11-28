@@ -357,10 +357,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # DSA sets use_mha=False inside piecewise/breakable graphs, so the MHA
         # companion never runs there and any prefix goes through sparse MLA.
+        backend = self.model_runner.attn_backend
         if self._kimi_k31_rocm_bcg:  # KDA + DSA: the hybrid backend wraps DSA
-            backend = self.model_runner.attn_backend.full_attn_backend
-            return isinstance(backend, DeepseekSparseAttnBackend)
-        return isinstance(self.model_runner.attn_backend, DeepseekSparseAttnBackend)
+            backend = backend.full_attn_backend
+        elif is_npu():
+            # The ascend backend also sits behind the KDA hybrid wrapper and
+            # reports DSA through use_dsa; it has no MHA companion path.
+            backend = getattr(backend, "full_attn_backend", backend)
+            if getattr(backend, "use_dsa", False):
+                return True
+        return isinstance(backend, DeepseekSparseAttnBackend)
 
     def __init__(self, model_runner: ModelRunner):
         if get_schedule().enable_mixed_chunk:
